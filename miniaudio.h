@@ -9190,8 +9190,7 @@ typedef enum
     ma_encoding_format_wav,
     ma_encoding_format_flac,
     ma_encoding_format_mp3,
-    ma_encoding_format_vorbis,
-    ma_encoding_format_preview
+    ma_encoding_format_vorbis
 } ma_encoding_format;
 #endif
 
@@ -9387,6 +9386,7 @@ typedef struct
     float quality;
 
     ma_allocation_callbacks allocationCallbacks;
+    ma_encoder_init_proc initFallback;
 } ma_encoder_config;
 
 MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingFormat, ma_format format, ma_uint32 channels, ma_uint32 sampleRate, float quality);
@@ -61623,6 +61623,10 @@ MA_API ma_result ma_encoder_init__internal(ma_encoder_write_proc onWrite, ma_enc
         {
             result = MA_INVALID_ARGS;
         } break;
+    }
+
+    if (result != MA_SUCCESS && pEncoder->config.initFallback != NULL) {
+        result = pEncoder->config.initFallback(pEncoder);
     }
 
     /* Getting here means we should have our backend callbacks set up. */
