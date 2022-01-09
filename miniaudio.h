@@ -2580,7 +2580,7 @@ delivered via callbacks with `ma_encoder_init()`. Below is an example for initia
 to output to a file.
 
     ```c
-    ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, FORMAT, CHANNELS, SAMPLE_RATE);
+    ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, FORMAT, CHANNELS, SAMPLE_RATE, 1.0);
     ma_encoder encoder;
     ma_result result = ma_encoder_init_file("my_file.wav", &config, &encoder);
     if (result != MA_SUCCESS) {
@@ -9190,7 +9190,8 @@ typedef enum
     ma_encoding_format_wav,
     ma_encoding_format_flac,
     ma_encoding_format_mp3,
-    ma_encoding_format_vorbis
+    ma_encoding_format_vorbis,
+    ma_encoding_format_preview
 } ma_encoding_format;
 #endif
 
@@ -9383,10 +9384,12 @@ typedef struct
     ma_format format;
     ma_uint32 channels;
     ma_uint32 sampleRate;
+    float quality;
+
     ma_allocation_callbacks allocationCallbacks;
 } ma_encoder_config;
 
-MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingFormat, ma_format format, ma_uint32 channels, ma_uint32 sampleRate);
+MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingFormat, ma_format format, ma_uint32 channels, ma_uint32 sampleRate, float quality);
 
 struct ma_encoder
 {
@@ -61546,7 +61549,7 @@ static ma_result ma_encoder__on_write_pcm_frames_wav(ma_encoder* pEncoder, const
 }
 #endif
 
-MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingFormat, ma_format format, ma_uint32 channels, ma_uint32 sampleRate)
+MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingFormat, ma_format format, ma_uint32 channels, ma_uint32 sampleRate, float quality)
 {
     ma_encoder_config config;
 
@@ -61555,6 +61558,7 @@ MA_API ma_encoder_config ma_encoder_config_init(ma_encoding_format encodingForma
     config.format = format;
     config.channels = channels;
     config.sampleRate = sampleRate;
+    config.quality = quality;
 
     return config;
 }
