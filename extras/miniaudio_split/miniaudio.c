@@ -1,6 +1,6 @@
 /*
 Audio playback and capture library. Choice of public domain or MIT-0. See license statements at the end of this file.
-miniaudio - v0.11.3 - 2022-01-07
+miniaudio - v0.11.6 - 2022-01-22
 
 David Reid - mackron@gmail.com
 
@@ -4535,7 +4535,6 @@ static ma_result ma_thread_create__posix(ma_thread* pThread, ma_thread_priority 
 static void ma_thread_wait__posix(ma_thread* pThread)
 {
     pthread_join((pthread_t)*pThread, NULL);
-    pthread_detach((pthread_t)*pThread);
 }
 
 
@@ -5269,6 +5268,752 @@ MA_API ma_result ma_async_notification_event_signal(ma_async_notification_event*
 
 
 
+/************************************************************************************************************************************************************
+
+Job Queue
+
+************************************************************************************************************************************************************/
+MA_API ma_slot_allocator_config ma_slot_allocator_config_init(ma_uint32 capacity)
+{
+    ma_slot_allocator_config config;
+
+    MA_ZERO_OBJECT(&config);
+    config.capacity = capacity;
+
+    return config;
+}
+
+
+static MA_INLINE ma_uint32 ma_slot_allocator_calculate_group_capacity(ma_uint32 slotCapacity)
+{
+    ma_uint32 cap = slotCapacity / 32;
+    if ((slotCapacity % 32) != 0) {
+        cap += 1;
+    }
+
+    return cap;
+}
+
+static MA_INLINE ma_uint32 ma_slot_allocator_group_capacity(const ma_slot_allocator* pAllocator)
+{
+    return ma_slot_allocator_calculate_group_capacity(pAllocator->capacity);
+}
+
+
+typedef struct
+{
+    size_t sizeInBytes;
+    size_t groupsOffset;
+    size_t slotsOffset;
+} ma_slot_allocator_heap_layout;
+
+static ma_result ma_slot_allocator_get_heap_layout(const ma_slot_allocator_config* pConfig, ma_slot_allocator_heap_layout* pHeapLayout)
+{
+    MA_ASSERT(pHeapLayout != NULL);
+
+    MA_ZERO_OBJECT(pHeapLayout);
+
+    if (pConfig == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (pConfig->capacity == 0) {
+        return MA_INVALID_ARGS;
+    }
+
+    pHeapLayout->sizeInBytes = 0;
+
+    /* Groups. */
+    pHeapLayout->groupsOffset = pHeapLayout->sizeInBytes;
+    pHeapLayout->sizeInBytes += ma_align_64(ma_slot_allocator_calculate_group_capacity(pConfig->capacity) * sizeof(ma_slot_allocator_group));
+
+    /* Slots. */
+    pHeapLayout->slotsOffset  = pHeapLayout->sizeInBytes;
+    pHeapLayout->sizeInBytes += ma_align_64(pConfig->capacity * sizeof(ma_uint32));
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_slot_allocator_get_heap_size(const ma_slot_allocator_config* pConfig, size_t* pHeapSizeInBytes)
+{
+    ma_result result;
+    ma_slot_allocator_heap_layout layout;
+
+    if (pHeapSizeInBytes == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pHeapSizeInBytes = 0;
+
+    result = ma_slot_allocator_get_heap_layout(pConfig, &layout);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pHeapSizeInBytes = layout.sizeInBytes;
+
+    return result;
+}
+
+MA_API ma_result ma_slot_allocator_init_preallocated(const ma_slot_allocator_config* pConfig, void* pHeap, ma_slot_allocator* pAllocator)
+{
+    ma_result result;
+    ma_slot_allocator_heap_layout heapLayout;
+
+    if (pAllocator == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    MA_ZERO_OBJECT(pAllocator);
+
+    if (pHeap == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    result = ma_slot_allocator_get_heap_layout(pConfig, &heapLayout);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    pAllocator->_pHeap = pHeap;
+    MA_ZERO_MEMORY(pHeap, heapLayout.sizeInBytes);
+
+    pAllocator->pGroups  = (ma_slot_allocator_group*)ma_offset_ptr(pHeap, heapLayout.groupsOffset);
+    pAllocator->pSlots   = (ma_uint32*)ma_offset_ptr(pHeap, heapLayout.slotsOffset);
+    pAllocator->capacity = pConfig->capacity;
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_slot_allocator_init(const ma_slot_allocator_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_slot_allocator* pAllocator)
+{
+    ma_result result;
+    size_t heapSizeInBytes;
+    void* pHeap;
+
+    result = ma_slot_allocator_get_heap_size(pConfig, &heapSizeInBytes);
+    if (result != MA_SUCCESS) {
+        return result;  /* Failed to retrieve the size of the heap allocation. */
+    }
+
+    if (heapSizeInBytes > 0) {
+        pHeap = ma_malloc(heapSizeInBytes, pAllocationCallbacks);
+        if (pHeap == NULL) {
+            return MA_OUT_OF_MEMORY;
+        }
+    } else {
+        pHeap = NULL;
+    }
+
+    result = ma_slot_allocator_init_preallocated(pConfig, pHeap, pAllocator);
+    if (result != MA_SUCCESS) {
+        ma_free(pHeap, pAllocationCallbacks);
+        return result;
+    }
+
+    pAllocator->_ownsHeap = MA_TRUE;
+    return MA_SUCCESS;
+}
+
+MA_API void ma_slot_allocator_uninit(ma_slot_allocator* pAllocator, const ma_allocation_callbacks* pAllocationCallbacks)
+{
+    if (pAllocator == NULL) {
+        return;
+    }
+
+    if (pAllocator->_ownsHeap) {
+        ma_free(pAllocator->_pHeap, pAllocationCallbacks);
+    }
+}
+
+MA_API ma_result ma_slot_allocator_alloc(ma_slot_allocator* pAllocator, ma_uint64* pSlot)
+{
+    ma_uint32 iAttempt;
+    const ma_uint32 maxAttempts = 2;    /* The number of iterations to perform until returning MA_OUT_OF_MEMORY if no slots can be found. */
+
+    if (pAllocator == NULL || pSlot == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    for (iAttempt = 0; iAttempt < maxAttempts; iAttempt += 1) {
+        /* We need to acquire a suitable bitfield first. This is a bitfield that's got an available slot within it. */
+        ma_uint32 iGroup;
+        for (iGroup = 0; iGroup < ma_slot_allocator_group_capacity(pAllocator); iGroup += 1) {
+            /* CAS */
+            for (;;) {
+                ma_uint32 oldBitfield;
+                ma_uint32 newBitfield;
+                ma_uint32 bitOffset;
+
+                oldBitfield = c89atomic_load_32(&pAllocator->pGroups[iGroup].bitfield);  /* <-- This copy must happen. The compiler must not optimize this away. */
+
+                /* Fast check to see if anything is available. */
+                if (oldBitfield == 0xFFFFFFFF) {
+                    break;  /* No available bits in this bitfield. */
+                }
+
+                bitOffset = ma_ffs_32(~oldBitfield);
+                MA_ASSERT(bitOffset < 32);
+
+                newBitfield = oldBitfield | (1 << bitOffset);
+
+                if (c89atomic_compare_and_swap_32(&pAllocator->pGroups[iGroup].bitfield, oldBitfield, newBitfield) == oldBitfield) {
+                    ma_uint32 slotIndex;
+
+                    /* Increment the counter as soon as possible to have other threads report out-of-memory sooner than later. */
+                    c89atomic_fetch_add_32(&pAllocator->count, 1);
+
+                    /* The slot index is required for constructing the output value. */
+                    slotIndex = (iGroup << 5) + bitOffset;  /* iGroup << 5 = iGroup * 32 */
+                    if (slotIndex >= pAllocator->capacity) {
+                        return MA_OUT_OF_MEMORY;
+                    }
+
+                    /* Increment the reference count before constructing the output value. */
+                    pAllocator->pSlots[slotIndex] += 1;
+
+                    /* Construct the output value. */
+                    *pSlot = (((ma_uint64)pAllocator->pSlots[slotIndex] << 32) | slotIndex);
+
+                    return MA_SUCCESS;
+                }
+            }
+        }
+
+        /* We weren't able to find a slot. If it's because we've reached our capacity we need to return MA_OUT_OF_MEMORY. Otherwise we need to do another iteration and try again. */
+        if (pAllocator->count < pAllocator->capacity) {
+            ma_yield();
+        } else {
+            return MA_OUT_OF_MEMORY;
+        }
+    }
+
+    /* We couldn't find a slot within the maximum number of attempts. */
+    return MA_OUT_OF_MEMORY;
+}
+
+MA_API ma_result ma_slot_allocator_free(ma_slot_allocator* pAllocator, ma_uint64 slot)
+{
+    ma_uint32 iGroup;
+    ma_uint32 iBit;
+
+    if (pAllocator == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    iGroup = (ma_uint32)((slot & 0xFFFFFFFF) >> 5);   /* slot / 32 */
+    iBit   = (ma_uint32)((slot & 0xFFFFFFFF) & 31);   /* slot % 32 */
+
+    if (iGroup >= ma_slot_allocator_group_capacity(pAllocator)) {
+        return MA_INVALID_ARGS;
+    }
+
+    MA_ASSERT(iBit < 32);   /* This must be true due to the logic we used to actually calculate it. */
+
+    while (c89atomic_load_32(&pAllocator->count) > 0) {
+        /* CAS */
+        ma_uint32 oldBitfield;
+        ma_uint32 newBitfield;
+
+        oldBitfield = c89atomic_load_32(&pAllocator->pGroups[iGroup].bitfield);  /* <-- This copy must happen. The compiler must not optimize this away. */
+        newBitfield = oldBitfield & ~(1 << iBit);
+
+        /* Debugging for checking for double-frees. */
+        #if defined(MA_DEBUG_OUTPUT)
+        {
+            if ((oldBitfield & (1 << iBit)) == 0) {
+                MA_ASSERT(MA_FALSE);    /* Double free detected.*/
+            }
+        }
+        #endif
+
+        if (c89atomic_compare_and_swap_32(&pAllocator->pGroups[iGroup].bitfield, oldBitfield, newBitfield) == oldBitfield) {
+            c89atomic_fetch_sub_32(&pAllocator->count, 1);
+            return MA_SUCCESS;
+        }
+    }
+
+    /* Getting here means there are no allocations available for freeing. */
+    return MA_INVALID_OPERATION;
+}
+
+
+#define MA_JOB_ID_NONE      ~((ma_uint64)0)
+#define MA_JOB_SLOT_NONE    (ma_uint16)(~0)
+
+static MA_INLINE ma_uint32 ma_job_extract_refcount(ma_uint64 toc)
+{
+    return (ma_uint32)(toc >> 32);
+}
+
+static MA_INLINE ma_uint16 ma_job_extract_slot(ma_uint64 toc)
+{
+    return (ma_uint16)(toc & 0x0000FFFF);
+}
+
+static MA_INLINE ma_uint16 ma_job_extract_code(ma_uint64 toc)
+{
+    return (ma_uint16)((toc & 0xFFFF0000) >> 16);
+}
+
+static MA_INLINE ma_uint64 ma_job_toc_to_allocation(ma_uint64 toc)
+{
+    return ((ma_uint64)ma_job_extract_refcount(toc) << 32) | (ma_uint64)ma_job_extract_slot(toc);
+}
+
+static MA_INLINE ma_uint64 ma_job_set_refcount(ma_uint64 toc, ma_uint32 refcount)
+{
+    /* Clear the reference count first. */
+    toc = toc & ~((ma_uint64)0xFFFFFFFF << 32);
+    toc = toc |  ((ma_uint64)refcount   << 32);
+
+    return toc;
+}
+
+
+MA_API ma_job ma_job_init(ma_uint16 code)
+{
+    ma_job job;
+
+    MA_ZERO_OBJECT(&job);
+    job.toc.breakup.code = code;
+    job.toc.breakup.slot = MA_JOB_SLOT_NONE;    /* Temp value. Will be allocated when posted to a queue. */
+    job.next             = MA_JOB_ID_NONE;
+
+    return job;
+}
+
+
+static ma_result ma_job_process__noop(ma_job* pJob);
+static ma_result ma_job_process__quit(ma_job* pJob);
+static ma_result ma_job_process__custom(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__load_data_buffer_node(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__free_data_buffer_node(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__page_data_buffer_node(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__load_data_buffer(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__free_data_buffer(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__load_data_stream(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__free_data_stream(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__page_data_stream(ma_job* pJob);
+static ma_result ma_job_process__resource_manager__seek_data_stream(ma_job* pJob);
+
+#if !defined(MA_NO_DEVICE_IO)
+static ma_result ma_job_process__device__aaudio_reroute(ma_job* pJob);
+#endif
+
+static ma_job_proc g_jobVTable[MA_JOB_TYPE_COUNT] =
+{
+    /* Miscellaneous. */
+    ma_job_process__quit,                                       /* MA_JOB_TYPE_QUIT */
+    ma_job_process__custom,                                     /* MA_JOB_TYPE_CUSTOM */
+
+    /* Resource Manager. */
+    ma_job_process__resource_manager__load_data_buffer_node,    /* MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_BUFFER_NODE */
+    ma_job_process__resource_manager__free_data_buffer_node,    /* MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER_NODE */
+    ma_job_process__resource_manager__page_data_buffer_node,    /* MA_JOB_TYPE_RESOURCE_MANAGER_PAGE_DATA_BUFFER_NODE */
+    ma_job_process__resource_manager__load_data_buffer,         /* MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_BUFFER */
+    ma_job_process__resource_manager__free_data_buffer,         /* MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER */
+    ma_job_process__resource_manager__load_data_stream,         /* MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_STREAM */
+    ma_job_process__resource_manager__free_data_stream,         /* MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_STREAM */
+    ma_job_process__resource_manager__page_data_stream,         /* MA_JOB_TYPE_RESOURCE_MANAGER_PAGE_DATA_STREAM */
+    ma_job_process__resource_manager__seek_data_stream,         /* MA_JOB_TYPE_RESOURCE_MANAGER_SEEK_DATA_STREAM */
+
+    /* Device. */
+#if !defined(MA_NO_DEVICE_IO)
+    ma_job_process__device__aaudio_reroute                      /*MA_JOB_TYPE_DEVICE_AAUDIO_REROUTE*/
+#endif
+};
+
+MA_API ma_result ma_job_process(ma_job* pJob)
+{
+    if (pJob == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (pJob->toc.breakup.code > MA_JOB_TYPE_COUNT) {
+        return MA_INVALID_OPERATION;
+    }
+
+    return g_jobVTable[pJob->toc.breakup.code](pJob);
+}
+
+static ma_result ma_job_process__noop(ma_job* pJob)
+{
+    MA_ASSERT(pJob != NULL);
+
+    /* No-op. */
+    (void)pJob;
+
+    return MA_SUCCESS;
+}
+
+static ma_result ma_job_process__quit(ma_job* pJob)
+{
+    return ma_job_process__noop(pJob);
+}
+
+static ma_result ma_job_process__custom(ma_job* pJob)
+{
+    MA_ASSERT(pJob != NULL);
+
+    /* No-op if there's no callback. */
+    if (pJob->data.custom.proc == NULL) {
+        return MA_SUCCESS;
+    }
+
+    return pJob->data.custom.proc(pJob);
+}
+
+
+
+MA_API ma_job_queue_config ma_job_queue_config_init(ma_uint32 flags, ma_uint32 capacity)
+{
+    ma_job_queue_config config;
+
+    config.flags    = flags;
+    config.capacity = capacity;
+
+    return config;
+}
+
+
+typedef struct
+{
+    size_t sizeInBytes;
+    size_t allocatorOffset;
+    size_t jobsOffset;
+} ma_job_queue_heap_layout;
+
+static ma_result ma_job_queue_get_heap_layout(const ma_job_queue_config* pConfig, ma_job_queue_heap_layout* pHeapLayout)
+{
+    ma_result result;
+
+    MA_ASSERT(pHeapLayout != NULL);
+
+    MA_ZERO_OBJECT(pHeapLayout);
+
+    if (pConfig == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (pConfig->capacity == 0) {
+        return MA_INVALID_ARGS;
+    }
+
+    pHeapLayout->sizeInBytes = 0;
+
+    /* Allocator. */
+    {
+        ma_slot_allocator_config allocatorConfig;
+        size_t allocatorHeapSizeInBytes;
+
+        allocatorConfig = ma_slot_allocator_config_init(pConfig->capacity);
+        result = ma_slot_allocator_get_heap_size(&allocatorConfig, &allocatorHeapSizeInBytes);
+        if (result != MA_SUCCESS) {
+            return result;
+        }
+
+        pHeapLayout->allocatorOffset = pHeapLayout->sizeInBytes;
+        pHeapLayout->sizeInBytes    += allocatorHeapSizeInBytes;
+    }
+
+    /* Jobs. */
+    pHeapLayout->jobsOffset   = pHeapLayout->sizeInBytes;
+    pHeapLayout->sizeInBytes += ma_align_64(pConfig->capacity * sizeof(ma_job));
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_job_queue_get_heap_size(const ma_job_queue_config* pConfig, size_t* pHeapSizeInBytes)
+{
+    ma_result result;
+    ma_job_queue_heap_layout layout;
+
+    if (pHeapSizeInBytes == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pHeapSizeInBytes = 0;
+
+    result = ma_job_queue_get_heap_layout(pConfig, &layout);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pHeapSizeInBytes = layout.sizeInBytes;
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_job_queue_init_preallocated(const ma_job_queue_config* pConfig, void* pHeap, ma_job_queue* pQueue)
+{
+    ma_result result;
+    ma_job_queue_heap_layout heapLayout;
+    ma_slot_allocator_config allocatorConfig;
+
+    if (pQueue == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    MA_ZERO_OBJECT(pQueue);
+
+    result = ma_job_queue_get_heap_layout(pConfig, &heapLayout);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    pQueue->_pHeap = pHeap;
+    MA_ZERO_MEMORY(pHeap, heapLayout.sizeInBytes);
+
+    pQueue->flags    = pConfig->flags;
+    pQueue->capacity = pConfig->capacity;
+    pQueue->pJobs    = (ma_job*)ma_offset_ptr(pHeap, heapLayout.jobsOffset);
+
+    allocatorConfig = ma_slot_allocator_config_init(pConfig->capacity);
+    result = ma_slot_allocator_init_preallocated(&allocatorConfig, ma_offset_ptr(pHeap, heapLayout.allocatorOffset), &pQueue->allocator);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    /* We need a semaphore if we're running in non-blocking mode. If threading is disabled we need to return an error. */
+    if ((pQueue->flags & MA_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
+        #ifndef MA_NO_THREADING
+        {
+            ma_semaphore_init(0, &pQueue->sem);
+        }
+        #else
+        {
+            /* Threading is disabled and we've requested non-blocking mode. */
+            return MA_INVALID_OPERATION;
+        }
+        #endif
+    }
+
+    /*
+    Our queue needs to be initialized with a free standing node. This should always be slot 0. Required for the lock free algorithm. The first job in the queue is
+    just a dummy item for giving us the first item in the list which is stored in the "next" member.
+    */
+    ma_slot_allocator_alloc(&pQueue->allocator, &pQueue->head);  /* Will never fail. */
+    pQueue->pJobs[ma_job_extract_slot(pQueue->head)].next = MA_JOB_ID_NONE;
+    pQueue->tail = pQueue->head;
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_job_queue_init(const ma_job_queue_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_job_queue* pQueue)
+{
+    ma_result result;
+    size_t heapSizeInBytes;
+    void* pHeap;
+
+    result = ma_job_queue_get_heap_size(pConfig, &heapSizeInBytes);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    if (heapSizeInBytes > 0) {
+        pHeap = ma_malloc(heapSizeInBytes, pAllocationCallbacks);
+        if (pHeap == NULL) {
+            return MA_OUT_OF_MEMORY;
+        }
+    } else {
+        pHeap = NULL;
+    }
+
+    result = ma_job_queue_init_preallocated(pConfig, pHeap, pQueue);
+    if (result != MA_SUCCESS) {
+        ma_free(pHeap, pAllocationCallbacks);
+        return result;
+    }
+
+    pQueue->_ownsHeap = MA_TRUE;
+    return MA_SUCCESS;
+}
+
+MA_API void ma_job_queue_uninit(ma_job_queue* pQueue, const ma_allocation_callbacks* pAllocationCallbacks)
+{
+    if (pQueue == NULL) {
+        return;
+    }
+
+    /* All we need to do is uninitialize the semaphore. */
+    if ((pQueue->flags & MA_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
+        #ifndef MA_NO_THREADING
+        {
+            ma_semaphore_uninit(&pQueue->sem);
+        }
+        #else
+        {
+            MA_ASSERT(MA_FALSE);    /* Should never get here. Should have been checked at initialization time. */
+        }
+        #endif
+    }
+
+    ma_slot_allocator_uninit(&pQueue->allocator, pAllocationCallbacks);
+
+    if (pQueue->_ownsHeap) {
+        ma_free(pQueue->_pHeap, pAllocationCallbacks);
+    }
+}
+
+static ma_bool32 ma_job_queue_cas(volatile ma_uint64* dst, ma_uint64 expected, ma_uint64 desired)
+{
+    /* The new counter is taken from the expected value. */
+    return c89atomic_compare_and_swap_64(dst, expected, ma_job_set_refcount(desired, ma_job_extract_refcount(expected) + 1)) == expected;
+}
+
+MA_API ma_result ma_job_queue_post(ma_job_queue* pQueue, const ma_job* pJob)
+{
+    /*
+    Lock free queue implementation based on the paper by Michael and Scott: Nonblocking Algorithms and Preemption-Safe Locking on Multiprogrammed Shared Memory Multiprocessors
+    */
+    ma_result result;
+    ma_uint64 slot;
+    ma_uint64 tail;
+    ma_uint64 next;
+
+    if (pQueue == NULL || pJob == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    /* We need a new slot. */
+    result = ma_slot_allocator_alloc(&pQueue->allocator, &slot);
+    if (result != MA_SUCCESS) {
+        return result;  /* Probably ran out of slots. If so, MA_OUT_OF_MEMORY will be returned. */
+    }
+
+    /* At this point we should have a slot to place the job. */
+    MA_ASSERT(ma_job_extract_slot(slot) < pQueue->capacity);
+
+    /* We need to put the job into memory before we do anything. */
+    pQueue->pJobs[ma_job_extract_slot(slot)]                  = *pJob;
+    pQueue->pJobs[ma_job_extract_slot(slot)].toc.allocation   = slot;                    /* This will overwrite the job code. */
+    pQueue->pJobs[ma_job_extract_slot(slot)].toc.breakup.code = pJob->toc.breakup.code;  /* The job code needs to be applied again because the line above overwrote it. */
+    pQueue->pJobs[ma_job_extract_slot(slot)].next             = MA_JOB_ID_NONE;          /* Reset for safety. */
+
+    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
+    ma_spinlock_lock(&pQueue->lock);
+    #endif
+    {
+        /* The job is stored in memory so now we need to add it to our linked list. We only ever add items to the end of the list. */
+        for (;;) {
+            tail = c89atomic_load_64(&pQueue->tail);
+            next = c89atomic_load_64(&pQueue->pJobs[ma_job_extract_slot(tail)].next);
+
+            if (ma_job_toc_to_allocation(tail) == ma_job_toc_to_allocation(c89atomic_load_64(&pQueue->tail))) {
+                if (ma_job_extract_slot(next) == 0xFFFF) {
+                    if (ma_job_queue_cas(&pQueue->pJobs[ma_job_extract_slot(tail)].next, next, slot)) {
+                        break;
+                    }
+                } else {
+                    ma_job_queue_cas(&pQueue->tail, tail, ma_job_extract_slot(next));
+                }
+            }
+        }
+        ma_job_queue_cas(&pQueue->tail, tail, slot);
+    }
+    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
+    ma_spinlock_unlock(&pQueue->lock);
+    #endif
+
+
+    /* Signal the semaphore as the last step if we're using synchronous mode. */
+    if ((pQueue->flags & MA_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
+        #ifndef MA_NO_THREADING
+        {
+            ma_semaphore_release(&pQueue->sem);
+        }
+        #else
+        {
+            MA_ASSERT(MA_FALSE);    /* Should never get here. Should have been checked at initialization time. */
+        }
+        #endif
+    }
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_job_queue_next(ma_job_queue* pQueue, ma_job* pJob)
+{
+    ma_uint64 head;
+    ma_uint64 tail;
+    ma_uint64 next;
+
+    if (pQueue == NULL || pJob == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    /* If we're running in synchronous mode we'll need to wait on a semaphore. */
+    if ((pQueue->flags & MA_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
+        #ifndef MA_NO_THREADING
+        {
+            ma_semaphore_wait(&pQueue->sem);
+        }
+        #else
+        {
+            MA_ASSERT(MA_FALSE);    /* Should never get here. Should have been checked at initialization time. */
+        }
+        #endif
+    }
+
+    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
+    ma_spinlock_lock(&pQueue->lock);
+    #endif
+    {
+        /*
+        BUG: In lock-free mode, multiple threads can be in this section of code. The "head" variable in the loop below
+        is stored. One thread can fall through to the freeing of this item while another is still using "head" for the
+        retrieval of the "next" variable.
+
+        The slot allocator might need to make use of some reference counting to ensure it's only truely freed when
+        there are no more references to the item. This must be fixed before removing these locks.
+        */
+
+        /* Now we need to remove the root item from the list. */
+        for (;;) {
+            head = c89atomic_load_64(&pQueue->head);
+            tail = c89atomic_load_64(&pQueue->tail);
+            next = c89atomic_load_64(&pQueue->pJobs[ma_job_extract_slot(head)].next);
+
+            if (ma_job_toc_to_allocation(head) == ma_job_toc_to_allocation(c89atomic_load_64(&pQueue->head))) {
+                if (ma_job_extract_slot(head) == ma_job_extract_slot(tail)) {
+                    if (ma_job_extract_slot(next) == 0xFFFF) {
+                        #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
+                        ma_spinlock_unlock(&pQueue->lock);
+                        #endif
+                        return MA_NO_DATA_AVAILABLE;
+                    }
+                    ma_job_queue_cas(&pQueue->tail, tail, ma_job_extract_slot(next));
+                } else {
+                    *pJob = pQueue->pJobs[ma_job_extract_slot(next)];
+                    if (ma_job_queue_cas(&pQueue->head, head, ma_job_extract_slot(next))) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
+    ma_spinlock_unlock(&pQueue->lock);
+    #endif
+
+    ma_slot_allocator_free(&pQueue->allocator, head);
+
+    /*
+    If it's a quit job make sure it's put back on the queue to ensure other threads have an opportunity to detect it and terminate naturally. We
+    could instead just leave it on the queue, but that would involve fiddling with the lock-free code above and I want to keep that as simple as
+    possible.
+    */
+    if (pJob->toc.breakup.code == MA_JOB_TYPE_QUIT) {
+        ma_job_queue_post(pQueue, pJob);
+        return MA_CANCELLED;    /* Return a cancelled status just in case the thread is checking return codes and not properly checking for a quit job. */
+    }
+
+    return MA_SUCCESS;
+}
+
+
+
 
 /************************************************************************************************************************************************************
 *************************************************************************************************************************************************************
@@ -5683,11 +6428,13 @@ typedef int     (WINAPI * MA_PFN_StringFromGUID2)(const GUID* const rguid, LPOLE
 typedef HWND (WINAPI * MA_PFN_GetForegroundWindow)(void);
 typedef HWND (WINAPI * MA_PFN_GetDesktopWindow)(void);
 
+#if defined(MA_WIN32_DESKTOP)
 /* Microsoft documents these APIs as returning LSTATUS, but the Win32 API shipping with some compilers do not define it. It's just a LONG. */
 typedef LONG (WINAPI * MA_PFN_RegOpenKeyExA)(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult);
 typedef LONG (WINAPI * MA_PFN_RegCloseKey)(HKEY hKey);
 typedef LONG (WINAPI * MA_PFN_RegQueryValueExA)(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
-#endif
+#endif  /* MA_WIN32_DESKTOP */
+#endif  /* MA_WIN32 */
 
 
 #define MA_DEFAULT_PLAYBACK_DEVICE_NAME    "Default Playback Device"
@@ -6039,16 +6786,13 @@ static void ma_device__on_data(ma_device* pDevice, void* pFramesOut, const void*
                 if (pDevice->capture.intermediaryBufferLen == pDevice->capture.intermediaryBufferCap) {
                     /* No room left in the intermediary buffer. Fire the data callback. */
                     if (pDevice->type == ma_device_type_duplex) {
-                        ma_device__on_data_inner(pDevice, pDevice->playback.pIntermediaryBuffer, pDevice->capture.pIntermediaryBuffer, pDevice->capture.intermediaryBufferCap);
-
-                        /* The playback buffer will have just been filled. */
-                        pDevice->playback.intermediaryBufferLen = pDevice->capture.intermediaryBufferCap;
+                        /* We'll do the duplex data callback later after we've processed the playback data. */
                     } else {
                         ma_device__on_data_inner(pDevice, NULL, pDevice->capture.pIntermediaryBuffer, pDevice->capture.intermediaryBufferCap);
-                    }
 
-                    /* The intermediary buffer has just been drained. */
-                    pDevice->capture.intermediaryBufferLen = 0;
+                        /* The intermediary buffer has just been drained. */
+                        pDevice->capture.intermediaryBufferLen = 0;
+                    }
                 }
             }
 
@@ -6077,7 +6821,7 @@ static void ma_device__on_data(ma_device* pDevice, void* pFramesOut, const void*
                 if (pDevice->playback.intermediaryBufferLen == 0) {
                     /* There's nothing in the intermediary buffer. Fire the data callback to fill it. */
                     if (pDevice->type == ma_device_type_duplex) {
-                        /* In duplex mode, the data callback will be fired from the capture side. Nothing to do here. */
+                        /* In duplex mode, the data callback will be fired later. Nothing to do here. */
                     } else {
                         ma_device__on_data_inner(pDevice, pDevice->playback.pIntermediaryBuffer, NULL, pDevice->playback.intermediaryBufferCap);
 
@@ -6085,6 +6829,16 @@ static void ma_device__on_data(ma_device* pDevice, void* pFramesOut, const void*
                         pDevice->playback.intermediaryBufferLen = pDevice->playback.intermediaryBufferCap;
                     }
                 }   
+            }
+
+            /* If we're in duplex mode we might need to do a refill of the data. */
+            if (pDevice->type == ma_device_type_duplex) {
+                if (pDevice->capture.intermediaryBufferLen == pDevice->capture.intermediaryBufferCap) {
+                    ma_device__on_data_inner(pDevice, pDevice->playback.pIntermediaryBuffer, pDevice->capture.pIntermediaryBuffer, pDevice->capture.intermediaryBufferCap);
+
+                    pDevice->playback.intermediaryBufferLen = pDevice->playback.intermediaryBufferCap;  /* The playback buffer will have just been filled. */
+                    pDevice->capture.intermediaryBufferLen  = 0;                                        /* The intermediary buffer has just been drained. */
+                }
             }
 
             /* Make sure this is only incremented once in the duplex case. */
@@ -6450,7 +7204,6 @@ MA_API ma_uint32 ma_get_format_priority_index(ma_format format) /* Lower = bette
 }
 
 static ma_result ma_device__post_init_setup(ma_device* pDevice, ma_device_type deviceType);
-
 
 static ma_bool32 ma_device_descriptor_is_valid(const ma_device_descriptor* pDeviceDescriptor)
 {
@@ -7465,7 +8218,7 @@ static const PROPERTYKEY MA_PKEY_Device_FriendlyName             = {{0xA45C254E,
 static const PROPERTYKEY MA_PKEY_AudioEngine_DeviceFormat        = {{0xF19F064D, 0x82C,  0x4E27, {0xBC, 0x73, 0x68, 0x82, 0xA1, 0xBB, 0x8E, 0x4C}},  0};
 
 static const IID MA_IID_IUnknown                                 = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}; /* 00000000-0000-0000-C000-000000000046 */
-#ifndef MA_WIN32_DESKTOP
+#if !defined(MA_WIN32_DESKTOP) && !defined(MA_WIN32_GDK)
 static const IID MA_IID_IAgileObject                             = {0x94EA2B94, 0xE9CC, 0x49E0, {0xC0, 0xFF, 0xEE, 0x64, 0xCA, 0x8F, 0x5B, 0x90}}; /* 94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90 */
 #endif
 
@@ -7475,7 +8228,7 @@ static const IID MA_IID_IAudioClient3                            = {0x7ED4EE07, 
 static const IID MA_IID_IAudioRenderClient                       = {0xF294ACFC, 0x3146, 0x4483, {0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2}}; /* F294ACFC-3146-4483-A7BF-ADDCA7C260E2 = __uuidof(IAudioRenderClient) */
 static const IID MA_IID_IAudioCaptureClient                      = {0xC8ADBD64, 0xE71E, 0x48A0, {0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17}}; /* C8ADBD64-E71E-48A0-A4DE-185C395CD317 = __uuidof(IAudioCaptureClient) */
 static const IID MA_IID_IMMNotificationClient                    = {0x7991EEC9, 0x7E89, 0x4D85, {0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0}}; /* 7991EEC9-7E89-4D85-8390-6C703CEC60C0 = __uuidof(IMMNotificationClient) */
-#ifndef MA_WIN32_DESKTOP
+#if !defined(MA_WIN32_DESKTOP) && !defined(MA_WIN32_GDK)
 static const IID MA_IID_DEVINTERFACE_AUDIO_RENDER                = {0xE6327CAD, 0xDCEC, 0x4949, {0xAE, 0x8A, 0x99, 0x1E, 0x97, 0x6A, 0x79, 0xD2}}; /* E6327CAD-DCEC-4949-AE8A-991E976A79D2 */
 static const IID MA_IID_DEVINTERFACE_AUDIO_CAPTURE               = {0x2EEF81BE, 0x33FA, 0x4800, {0x96, 0x70, 0x1C, 0xD4, 0x74, 0x97, 0x2C, 0x3F}}; /* 2EEF81BE-33FA-4800-9670-1CD474972C3F */
 static const IID MA_IID_IActivateAudioInterfaceCompletionHandler = {0x41D949AB, 0x9862, 0x444A, {0x80, 0xF6, 0xC2, 0x61, 0x33, 0x4D, 0xA5, 0xEB}}; /* 41D949AB-9862-444A-80F6-C261334DA5EB */
@@ -7492,7 +8245,7 @@ static const IID MA_IID_IMMDeviceEnumerator_Instance             = {0xA95664D2, 
 #endif
 
 typedef struct ma_IUnknown                                 ma_IUnknown;
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
 #define MA_MM_DEVICE_STATE_ACTIVE                          1
 #define MA_MM_DEVICE_STATE_DISABLED                        2
 #define MA_MM_DEVICE_STATE_NOTPRESENT                      4
@@ -7578,7 +8331,7 @@ static MA_INLINE HRESULT ma_IUnknown_QueryInterface(ma_IUnknown* pThis, const II
 static MA_INLINE ULONG   ma_IUnknown_AddRef(ma_IUnknown* pThis)                                                 { return pThis->lpVtbl->AddRef(pThis); }
 static MA_INLINE ULONG   ma_IUnknown_Release(ma_IUnknown* pThis)                                                { return pThis->lpVtbl->Release(pThis); }
 
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     /* IMMNotificationClient */
     typedef struct
     {
@@ -7922,7 +8675,7 @@ static MA_INLINE HRESULT ma_IAudioCaptureClient_GetBuffer(ma_IAudioCaptureClient
 static MA_INLINE HRESULT ma_IAudioCaptureClient_ReleaseBuffer(ma_IAudioCaptureClient* pThis, ma_uint32 numFramesRead)                 { return pThis->lpVtbl->ReleaseBuffer(pThis, numFramesRead); }
 static MA_INLINE HRESULT ma_IAudioCaptureClient_GetNextPacketSize(ma_IAudioCaptureClient* pThis, ma_uint32* pNumFramesInNextPacket)   { return pThis->lpVtbl->GetNextPacketSize(pThis, pNumFramesInNextPacket); }
 
-#ifndef MA_WIN32_DESKTOP
+#if !defined(MA_WIN32_DESKTOP) && !defined(MA_WIN32_GDK)
 #include <mmdeviceapi.h>
 typedef struct ma_completion_handler_uwp ma_completion_handler_uwp;
 
@@ -8019,7 +8772,7 @@ static void ma_completion_handler_uwp_wait(ma_completion_handler_uwp* pHandler)
 #endif  /* !MA_WIN32_DESKTOP */
 
 /* We need a virtual table for our notification client object that's used for detecting changes to the default device. */
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
 static HRESULT STDMETHODCALLTYPE ma_IMMNotificationClient_QueryInterface(ma_IMMNotificationClient* pThis, const IID* const riid, void** ppObject)
 {
     /*
@@ -8274,7 +9027,7 @@ static ma_IMMNotificationClientVtbl g_maNotificationCientVtbl = {
 };
 #endif  /* MA_WIN32_DESKTOP */
 
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
 typedef ma_IMMDevice ma_WASAPIDeviceInterface;
 #else
 typedef ma_IUnknown ma_WASAPIDeviceInterface;
@@ -8503,7 +9256,7 @@ static ma_result ma_context_get_device_info_from_IAudioClient__wasapi(ma_context
     UWP. Failure to retrieve the exclusive mode format is not considered an error, so from here on
     out, MA_SUCCESS is guaranteed to be returned.
     */
-    #ifdef MA_WIN32_DESKTOP
+    #if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     {
         ma_IPropertyStore *pProperties;
 
@@ -8603,7 +9356,7 @@ static ma_result ma_context_get_device_info_from_IAudioClient__wasapi(ma_context
     return MA_SUCCESS;
 }
 
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
 static ma_EDataFlow ma_device_type_to_EDataFlow(ma_device_type deviceType)
 {
     if (deviceType == ma_device_type_playback) {
@@ -8971,7 +9724,7 @@ static ma_result ma_context_get_IAudioClient_UWP__wasapi(ma_context* pContext, m
 
 static ma_result ma_context_get_IAudioClient__wasapi(ma_context* pContext, ma_device_type deviceType, const ma_device_id* pDeviceID, ma_IAudioClient** ppAudioClient, ma_WASAPIDeviceInterface** ppDeviceInterface)
 {
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     return ma_context_get_IAudioClient_Desktop__wasapi(pContext, deviceType, pDeviceID, ppAudioClient, ppDeviceInterface);
 #else
     return ma_context_get_IAudioClient_UWP__wasapi(pContext, deviceType, pDeviceID, ppAudioClient, ppDeviceInterface);
@@ -8982,7 +9735,7 @@ static ma_result ma_context_get_IAudioClient__wasapi(ma_context* pContext, ma_de
 static ma_result ma_context_enumerate_devices__wasapi(ma_context* pContext, ma_enum_devices_callback_proc callback, void* pUserData)
 {
     /* Different enumeration for desktop and UWP. */
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     /* Desktop */
     HRESULT hr;
     ma_IMMDeviceEnumerator* pDeviceEnumerator;
@@ -9034,7 +9787,7 @@ static ma_result ma_context_enumerate_devices__wasapi(ma_context* pContext, ma_e
 
 static ma_result ma_context_get_device_info__wasapi(ma_context* pContext, ma_device_type deviceType, const ma_device_id* pDeviceID, ma_device_info* pDeviceInfo)
 {
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     ma_result result;
     ma_IMMDevice* pMMDevice = NULL;
     LPWSTR pDefaultDeviceID = NULL;
@@ -9086,7 +9839,7 @@ static ma_result ma_device_uninit__wasapi(ma_device* pDevice)
 {
     MA_ASSERT(pDevice != NULL);
 
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     if (pDevice->wasapi.pDeviceEnumerator) {
         ((ma_IMMDeviceEnumerator*)pDevice->wasapi.pDeviceEnumerator)->lpVtbl->UnregisterEndpointNotificationCallback((ma_IMMDeviceEnumerator*)pDevice->wasapi.pDeviceEnumerator, &pDevice->wasapi.notificationClient);
         ma_IMMDeviceEnumerator_Release((ma_IMMDeviceEnumerator*)pDevice->wasapi.pDeviceEnumerator);
@@ -9094,9 +9847,23 @@ static ma_result ma_device_uninit__wasapi(ma_device* pDevice)
 #endif
 
     if (pDevice->wasapi.pRenderClient) {
+        if (pDevice->wasapi.pMappedBufferPlayback != NULL) {
+            ma_IAudioRenderClient_ReleaseBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, pDevice->wasapi.mappedBufferPlaybackCap, 0);
+            pDevice->wasapi.pMappedBufferPlayback   = NULL;
+            pDevice->wasapi.mappedBufferPlaybackCap = 0;
+            pDevice->wasapi.mappedBufferPlaybackLen = 0;
+        }
+
         ma_IAudioRenderClient_Release((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient);
     }
     if (pDevice->wasapi.pCaptureClient) {
+        if (pDevice->wasapi.pMappedBufferCapture != NULL) {
+            ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, pDevice->wasapi.mappedBufferCaptureCap);
+            pDevice->wasapi.pMappedBufferCapture   = NULL;
+            pDevice->wasapi.mappedBufferCaptureCap = 0;
+            pDevice->wasapi.mappedBufferCaptureLen = 0;
+        }
+
         ma_IAudioCaptureClient_Release((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient);
     }
 
@@ -9215,7 +9982,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
     /* Here is where we try to determine the best format to use with the device. If the client if wanting exclusive mode, first try finding the best format for that. If this fails, fall back to shared mode. */
     result = MA_FORMAT_NOT_SUPPORTED;
     if (pData->shareMode == ma_share_mode_exclusive) {
-    #ifdef MA_WIN32_DESKTOP
+    #if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
         /* In exclusive mode on desktop we always use the backend's native format. */
         ma_IPropertyStore* pStore = NULL;
         hr = ma_IMMDevice_OpenPropertyStore(pDeviceInterface, STGM_READ, &pStore);
@@ -9327,7 +10094,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
 
     /* Slightly different initialization for shared and exclusive modes. We try exclusive mode first, and if it fails, fall back to shared mode. */
     if (shareMode == MA_AUDCLNT_SHAREMODE_EXCLUSIVE) {
-        MA_REFERENCE_TIME bufferDuration = periodDurationInMicroseconds * 10;
+        MA_REFERENCE_TIME bufferDuration = periodDurationInMicroseconds * pData->periodsOut * 10;
 
         /*
         If the periodicy is too small, Initialize() will fail with AUDCLNT_E_INVALID_DEVICE_PERIOD. In this case we should just keep increasing
@@ -9361,7 +10128,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
                 /* Unfortunately we need to release and re-acquire the audio client according to MSDN. Seems silly - why not just call IAudioClient_Initialize() again?! */
                 ma_IAudioClient_Release((ma_IAudioClient*)pData->pAudioClient);
 
-            #ifdef MA_WIN32_DESKTOP
+            #if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
                 hr = ma_IMMDevice_Activate(pDeviceInterface, &MA_IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pData->pAudioClient);
             #else
                 hr = ma_IUnknown_QueryInterface(pDeviceInterface, &MA_IID_IAudioClient, (void**)&pData->pAudioClient);
@@ -9505,7 +10272,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
 
 
     /* Grab the name of the device. */
-    #ifdef MA_WIN32_DESKTOP
+    #if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     {
         ma_IPropertyStore *pProperties;
         hr = ma_IMMDevice_OpenPropertyStore(pDeviceInterface, STGM_READ, &pProperties);
@@ -9528,7 +10295,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
     stream routing so that IDs can be compared and we can determine which device has been detached
     and whether or not it matches with our ma_device.
     */
-    #ifdef MA_WIN32_DESKTOP
+    #if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     {
         /* Desktop */
         ma_context_get_device_id_from_MMDevice__wasapi(pContext, pDeviceInterface, &pData->id);
@@ -9542,7 +10309,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
 
 done:
     /* Clean up. */
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     if (pDeviceInterface != NULL) {
         ma_IMMDevice_Release(pDeviceInterface);
     }
@@ -9665,7 +10432,7 @@ static ma_result ma_device_reinit__wasapi(ma_device* pDevice, ma_device_type dev
         ma_IAudioClient_SetEventHandle((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture,  pDevice->wasapi.hEventCapture);
 
         pDevice->wasapi.periodSizeInFramesCapture = data.periodSizeInFramesOut;
-        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, &pDevice->wasapi.actualPeriodSizeInFramesCapture);
+        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, &pDevice->wasapi.actualBufferSizeInFramesCapture);
 
         /* We must always have a valid ID. */
         ma_wcscpy_s(pDevice->capture.id.wasapi, sizeof(pDevice->capture.id.wasapi), data.id.wasapi);
@@ -9686,7 +10453,7 @@ static ma_result ma_device_reinit__wasapi(ma_device* pDevice, ma_device_type dev
         ma_IAudioClient_SetEventHandle((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, pDevice->wasapi.hEventPlayback);
 
         pDevice->wasapi.periodSizeInFramesPlayback = data.periodSizeInFramesOut;
-        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, &pDevice->wasapi.actualPeriodSizeInFramesPlayback);
+        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, &pDevice->wasapi.actualBufferSizeInFramesPlayback);
 
         /* We must always have a valid ID because rerouting will look at it. */
         ma_wcscpy_s(pDevice->playback.id.wasapi, sizeof(pDevice->playback.id.wasapi), data.id.wasapi);
@@ -9699,7 +10466,7 @@ static ma_result ma_device_init__wasapi(ma_device* pDevice, const ma_device_conf
 {
     ma_result result = MA_SUCCESS;
 
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     HRESULT hr;
     ma_IMMDeviceEnumerator* pDeviceEnumerator;
 #endif
@@ -9766,7 +10533,7 @@ static ma_result ma_device_init__wasapi(ma_device* pDevice, const ma_device_conf
         ma_IAudioClient_SetEventHandle((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, pDevice->wasapi.hEventCapture);
 
         pDevice->wasapi.periodSizeInFramesCapture = data.periodSizeInFramesOut;
-        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, &pDevice->wasapi.actualPeriodSizeInFramesCapture);
+        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, &pDevice->wasapi.actualBufferSizeInFramesCapture);
 
         /* We must always have a valid ID. */
         ma_wcscpy_s(pDevice->capture.id.wasapi, sizeof(pDevice->capture.id.wasapi), data.id.wasapi);
@@ -9860,7 +10627,7 @@ static ma_result ma_device_init__wasapi(ma_device* pDevice, const ma_device_conf
         ma_IAudioClient_SetEventHandle((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, pDevice->wasapi.hEventPlayback);
 
         pDevice->wasapi.periodSizeInFramesPlayback = data.periodSizeInFramesOut;
-        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, &pDevice->wasapi.actualPeriodSizeInFramesPlayback);
+        ma_IAudioClient_GetBufferSize((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, &pDevice->wasapi.actualBufferSizeInFramesPlayback);
 
         /* We must always have a valid ID because rerouting will look at it. */
         ma_wcscpy_s(pDevice->playback.id.wasapi, sizeof(pDevice->playback.id.wasapi), data.id.wasapi);
@@ -9879,7 +10646,7 @@ static ma_result ma_device_init__wasapi(ma_device* pDevice, const ma_device_conf
     we are connecting to the default device we want to do automatic stream routing when the device is disabled or unplugged. Otherwise we want to just
     stop the device outright and let the application handle it.
     */
-#ifdef MA_WIN32_DESKTOP
+#if defined(MA_WIN32_DESKTOP) || defined(MA_WIN32_GDK)
     if (pConfig->wasapi.noAutoStreamRouting == MA_FALSE) {
         if ((pConfig->deviceType == ma_device_type_capture || pConfig->deviceType == ma_device_type_duplex) && pConfig->capture.pDeviceID == NULL) {
             pDevice->wasapi.allowCaptureAutoStreamRouting = MA_TRUE;
@@ -9954,16 +10721,16 @@ static ma_result ma_device__get_available_frames__wasapi(ma_device* pDevice, ma_
         }
 
         if ((ma_ptr)pAudioClient == pDevice->wasapi.pAudioClientPlayback) {
-            *pFrameCount = pDevice->wasapi.actualPeriodSizeInFramesPlayback - paddingFramesCount;
+            *pFrameCount = pDevice->wasapi.actualBufferSizeInFramesPlayback - paddingFramesCount;
         } else {
             *pFrameCount = paddingFramesCount;
         }
     } else {
         /* Exclusive mode. */
         if ((ma_ptr)pAudioClient == pDevice->wasapi.pAudioClientPlayback) {
-            *pFrameCount = pDevice->wasapi.actualPeriodSizeInFramesPlayback;
+            *pFrameCount = pDevice->wasapi.actualBufferSizeInFramesPlayback;
         } else {
-            *pFrameCount = pDevice->wasapi.actualPeriodSizeInFramesCapture;
+            *pFrameCount = pDevice->wasapi.actualBufferSizeInFramesCapture;
         }
     }
 
@@ -10011,7 +10778,13 @@ static ma_result ma_device_start__wasapi(ma_device* pDevice)
     }
 
     if (pDevice->type == ma_device_type_playback || pDevice->type == ma_device_type_duplex) {
-        /* No need to do anything for playback as that'll be started automatically in the data loop. */
+        hr = ma_IAudioClient_Start((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback);
+        if (FAILED(hr)) {
+            ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to start internal playback device.");
+            return ma_result_from_HRESULT(hr);
+        }
+
+        c89atomic_exchange_32(&pDevice->wasapi.isStartedPlayback, MA_TRUE);
     }
 
     return MA_SUCCESS;
@@ -10038,6 +10811,14 @@ static ma_result ma_device_stop__wasapi(ma_device* pDevice)
             return ma_result_from_HRESULT(hr);
         }
 
+        /* If we have a mapped buffer we need to release it. */
+        if (pDevice->wasapi.pMappedBufferCapture != NULL) {
+            ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, pDevice->wasapi.mappedBufferCaptureCap);
+            pDevice->wasapi.pMappedBufferCapture   = NULL;
+            pDevice->wasapi.mappedBufferCaptureCap = 0;
+            pDevice->wasapi.mappedBufferCaptureLen = 0;
+        }
+
         c89atomic_exchange_32(&pDevice->wasapi.isStartedCapture, MA_FALSE);
     }
 
@@ -10048,7 +10829,7 @@ static ma_result ma_device_stop__wasapi(ma_device* pDevice)
         */
         if (c89atomic_load_32(&pDevice->wasapi.isStartedPlayback)) {
             /* We need to make sure we put a timeout here or else we'll risk getting stuck in a deadlock in some cases. */
-            DWORD waitTime = pDevice->wasapi.actualPeriodSizeInFramesPlayback / pDevice->playback.internalSampleRate;
+            DWORD waitTime = pDevice->wasapi.actualBufferSizeInFramesPlayback / pDevice->playback.internalSampleRate;
 
             if (pDevice->playback.shareMode == ma_share_mode_exclusive) {
                 WaitForSingleObject(pDevice->wasapi.hEventPlayback, waitTime);
@@ -10061,7 +10842,7 @@ static ma_result ma_device_stop__wasapi(ma_device* pDevice)
                         break;
                     }
 
-                    if (framesAvailablePlayback >= pDevice->wasapi.actualPeriodSizeInFramesPlayback) {
+                    if (framesAvailablePlayback >= pDevice->wasapi.actualBufferSizeInFramesPlayback) {
                         break;
                     }
 
@@ -10093,6 +10874,13 @@ static ma_result ma_device_stop__wasapi(ma_device* pDevice)
             return ma_result_from_HRESULT(hr);
         }
 
+        if (pDevice->wasapi.pMappedBufferPlayback != NULL) {
+            ma_IAudioRenderClient_ReleaseBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, pDevice->wasapi.mappedBufferPlaybackCap, 0);
+            pDevice->wasapi.pMappedBufferPlayback   = NULL;
+            pDevice->wasapi.mappedBufferPlaybackCap = 0;
+            pDevice->wasapi.mappedBufferPlaybackLen = 0;
+        }
+
         c89atomic_exchange_32(&pDevice->wasapi.isStartedPlayback, MA_FALSE);
     }
 
@@ -10104,505 +10892,237 @@ static ma_result ma_device_stop__wasapi(ma_device* pDevice)
 #define MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS 5000
 #endif
 
-static ma_result ma_device_data_loop__wasapi(ma_device* pDevice)
+static ma_result ma_device_read__wasapi(ma_device* pDevice, void* pFrames, ma_uint32 frameCount, ma_uint32* pFramesRead)
 {
-    ma_result result;
-    HRESULT hr;
-    ma_bool32 exitLoop = MA_FALSE;
-    ma_uint32 framesWrittenToPlaybackDevice = 0;
-    ma_uint32 mappedDeviceBufferSizeInFramesCapture = 0;
-    ma_uint32 mappedDeviceBufferSizeInFramesPlayback = 0;
-    ma_uint32 mappedDeviceBufferFramesRemainingCapture = 0;
-    ma_uint32 mappedDeviceBufferFramesRemainingPlayback = 0;
-    BYTE* pMappedDeviceBufferCapture = NULL;
-    BYTE* pMappedDeviceBufferPlayback = NULL;
-    ma_uint32 bpfCaptureDevice = ma_get_bytes_per_frame(pDevice->capture.internalFormat, pDevice->capture.internalChannels);
-    ma_uint32 bpfPlaybackDevice = ma_get_bytes_per_frame(pDevice->playback.internalFormat, pDevice->playback.internalChannels);
-    ma_uint32 bpfCaptureClient = ma_get_bytes_per_frame(pDevice->capture.format, pDevice->capture.channels);
-    ma_uint32 bpfPlaybackClient = ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
-    ma_uint8  inputDataInClientFormat[MA_DATA_CONVERTER_STACK_BUFFER_SIZE];
-    ma_uint32 inputDataInClientFormatCap = 0;
-    ma_uint8  outputDataInClientFormat[MA_DATA_CONVERTER_STACK_BUFFER_SIZE];
-    ma_uint32 outputDataInClientFormatCap = 0;
-    ma_uint32 outputDataInClientFormatCount = 0;
-    ma_uint32 outputDataInClientFormatConsumed = 0;
-    ma_uint32 periodSizeInFramesCapture = 0;
+    ma_result result = MA_SUCCESS;
+    ma_uint32 totalFramesProcessed = 0;
 
-    MA_ASSERT(pDevice != NULL);
+    /*
+    When reading, we need to get a buffer and process all of it before releasing it. Because the
+    frame count (frameCount) can be different to the size of the buffer, we'll need to cache the
+    pointer to the buffer.
+    */
 
-    if (pDevice->type == ma_device_type_capture || pDevice->type == ma_device_type_duplex || pDevice->type == ma_device_type_loopback) {
-        periodSizeInFramesCapture  = pDevice->capture.internalPeriodSizeInFrames;
-        inputDataInClientFormatCap = sizeof(inputDataInClientFormat) / bpfCaptureClient;
-    }
+    /* Keep running until we've processed the requested number of frames. */
+    while (ma_device_get_state(pDevice) == ma_device_state_started && totalFramesProcessed < frameCount) {
+        ma_uint32 framesRemaining = frameCount - totalFramesProcessed;
 
-    if (pDevice->type == ma_device_type_playback || pDevice->type == ma_device_type_duplex) {
-        outputDataInClientFormatCap = sizeof(outputDataInClientFormat) / bpfPlaybackClient;
-    }
+        /* If we have a mapped data buffer, consume that first. */
+        if (pDevice->wasapi.pMappedBufferCapture != NULL) {
+            /* We have a cached data pointer so consume that before grabbing another one from WASAPI. */
+            ma_uint32 framesToProcessNow = framesRemaining;
+            if (framesToProcessNow > pDevice->wasapi.mappedBufferCaptureLen) {
+                framesToProcessNow = pDevice->wasapi.mappedBufferCaptureLen;
+            }
 
-    while (ma_device_get_state(pDevice) == ma_device_state_started && !exitLoop) {
-        switch (pDevice->type)
-        {
-            case ma_device_type_duplex:
-            {
-                ma_uint32 framesAvailableCapture;
-                ma_uint32 framesAvailablePlayback;
-                DWORD flagsCapture;    /* Passed to IAudioCaptureClient_GetBuffer(). */
+            /* Now just copy the data over to the output buffer. */
+            ma_copy_pcm_frames(
+                ma_offset_pcm_frames_ptr(pFrames, totalFramesProcessed, pDevice->capture.internalFormat, pDevice->capture.internalChannels),
+                ma_offset_pcm_frames_const_ptr(pDevice->wasapi.pMappedBufferCapture, pDevice->wasapi.mappedBufferCaptureCap - pDevice->wasapi.mappedBufferCaptureLen, pDevice->capture.internalFormat, pDevice->capture.internalChannels),
+                framesToProcessNow,
+                pDevice->capture.internalFormat, pDevice->capture.internalChannels
+            );
 
-                /* The process is to map the playback buffer and fill it as quickly as possible from input data. */
-                if (pMappedDeviceBufferPlayback == NULL) {
-                    result = ma_device__get_available_frames__wasapi(pDevice, (ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, &framesAvailablePlayback);
-                    if (result != MA_SUCCESS) {
-                        return result;
-                    }
+            totalFramesProcessed                   += framesToProcessNow;
+            pDevice->wasapi.mappedBufferCaptureLen -= framesToProcessNow;
 
-                    /* In exclusive mode, the frame count needs to exactly match the value returned by GetCurrentPadding(). */
-                    if (pDevice->playback.shareMode != ma_share_mode_exclusive) {
-                        if (framesAvailablePlayback > pDevice->wasapi.periodSizeInFramesPlayback) {
-                            framesAvailablePlayback = pDevice->wasapi.periodSizeInFramesPlayback;
-                        }
-                    }
+            /* If the data buffer has been fully consumed we need to release it. */
+            if (pDevice->wasapi.mappedBufferCaptureLen == 0) {
+                ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, pDevice->wasapi.mappedBufferCaptureCap);
+                pDevice->wasapi.pMappedBufferCapture   = NULL;
+                pDevice->wasapi.mappedBufferCaptureCap = 0;
+            }
+        } else {
+            /* We don't have any cached data pointer, so grab another one. */
+            HRESULT hr;
+            DWORD flags;
 
-                    /* We're ready to map the playback device's buffer. We don't release this until it's been entirely filled. */
-                    hr = ma_IAudioRenderClient_GetBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, framesAvailablePlayback, &pMappedDeviceBufferPlayback);
-                    if (FAILED(hr)) {
-                        ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from playback device in preparation for writing to the device.");
-                        exitLoop = MA_TRUE;
-                        break;
-                    }
-
-                    mappedDeviceBufferSizeInFramesPlayback    = framesAvailablePlayback;
-                    mappedDeviceBufferFramesRemainingPlayback = framesAvailablePlayback;
-                }
-
-                if (mappedDeviceBufferFramesRemainingPlayback > 0) {
-                    /* At this point we should have a buffer available for output. We need to keep writing input samples to it. */
-                    for (;;) {
-                        /* Try grabbing some captured data if we haven't already got a mapped buffer. */
-                        if (pMappedDeviceBufferCapture == NULL) {
-                            if (pDevice->capture.shareMode == ma_share_mode_shared) {
-                                if (WaitForSingleObject(pDevice->wasapi.hEventCapture, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
-                                    return MA_ERROR;   /* Wait failed. */
-                                }
-                            }
-
-                            result = ma_device__get_available_frames__wasapi(pDevice, (ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, &framesAvailableCapture);
-                            if (result != MA_SUCCESS) {
-                                exitLoop = MA_TRUE;
-                                break;
-                            }
-
-                            /* Wait for more if nothing is available. */
-                            if (framesAvailableCapture == 0) {
-                                /* In exclusive mode we waited at the top. */
-                                if (pDevice->capture.shareMode != ma_share_mode_shared) {
-                                    if (WaitForSingleObject(pDevice->wasapi.hEventCapture, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
-                                        return MA_ERROR;   /* Wait failed. */
-                                    }
-                                }
-
-                                continue;
-                            }
-
-                            /* Getting here means there's data available for writing to the output device. */
-                            mappedDeviceBufferSizeInFramesCapture = ma_min(framesAvailableCapture, periodSizeInFramesCapture);
-                            hr = ma_IAudioCaptureClient_GetBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, (BYTE**)&pMappedDeviceBufferCapture, &mappedDeviceBufferSizeInFramesCapture, &flagsCapture, NULL, NULL);
-                            if (FAILED(hr)) {
-                                ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from capture device in preparation for writing to the device.");
-                                exitLoop = MA_TRUE;
-                                break;
-                            }
-
-
-                            /* Overrun detection. */
-                            if ((flagsCapture & MA_AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
-                                /* Glitched. Probably due to an overrun. */
-                                ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Data discontinuity (possible overrun). framesAvailableCapture=%d, mappedBufferSizeInFramesCapture=%d\n", framesAvailableCapture, mappedDeviceBufferSizeInFramesCapture);
-
-                                /*
-                                Exeriment: If we get an overrun it probably means we're straddling the end of the buffer. In order to prevent a never-ending sequence of glitches let's experiment
-                                by dropping every frame until we're left with only a single period. To do this we just keep retrieving and immediately releasing buffers until we're down to the
-                                last period.
-                                */
-                                if (framesAvailableCapture >= pDevice->wasapi.actualPeriodSizeInFramesCapture) {
-                                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Synchronizing capture stream. ");
-                                    do
-                                    {
-                                        hr = ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, mappedDeviceBufferSizeInFramesCapture);
-                                        if (FAILED(hr)) {
-                                            break;
-                                        }
-
-                                        framesAvailableCapture -= mappedDeviceBufferSizeInFramesCapture;
-
-                                        if (framesAvailableCapture > 0) {
-                                            mappedDeviceBufferSizeInFramesCapture = ma_min(framesAvailableCapture, periodSizeInFramesCapture);
-                                            hr = ma_IAudioCaptureClient_GetBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, (BYTE**)&pMappedDeviceBufferCapture, &mappedDeviceBufferSizeInFramesCapture, &flagsCapture, NULL, NULL);
-                                            if (FAILED(hr)) {
-                                                ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from capture device in preparation for writing to the device.");
-                                                exitLoop = MA_TRUE;
-                                                break;
-                                            }
-                                        } else {
-                                            pMappedDeviceBufferCapture = NULL;
-                                            mappedDeviceBufferSizeInFramesCapture = 0;
-                                        }
-                                    } while (framesAvailableCapture > periodSizeInFramesCapture);
-                                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "framesAvailableCapture=%d, mappedBufferSizeInFramesCapture=%d\n", framesAvailableCapture, mappedDeviceBufferSizeInFramesCapture);
-                                }
-                            } else {
-                                if (flagsCapture != 0) {
-                                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Capture Flags: %ld\n", flagsCapture);
-                                }
-                            }
-
-                            mappedDeviceBufferFramesRemainingCapture = mappedDeviceBufferSizeInFramesCapture;
-                        }
-
-
-                        /* At this point we should have both input and output data available. We now need to convert the data and post it to the client. */
-                        for (;;) {
-                            BYTE* pRunningDeviceBufferCapture;
-                            BYTE* pRunningDeviceBufferPlayback;
-                            ma_uint32 framesToProcess;
-                            ma_uint32 framesProcessed;
-
-                            pRunningDeviceBufferCapture  = pMappedDeviceBufferCapture  + ((mappedDeviceBufferSizeInFramesCapture  - mappedDeviceBufferFramesRemainingCapture ) * bpfCaptureDevice);
-                            pRunningDeviceBufferPlayback = pMappedDeviceBufferPlayback + ((mappedDeviceBufferSizeInFramesPlayback - mappedDeviceBufferFramesRemainingPlayback) * bpfPlaybackDevice);
-
-                            /* There may be some data sitting in the converter that needs to be processed first. Once this is exhaused, run the data callback again. */
-                            if (!pDevice->playback.converter.isPassthrough && outputDataInClientFormatConsumed < outputDataInClientFormatCount) {
-                                ma_uint64 convertedFrameCountClient = (outputDataInClientFormatCount - outputDataInClientFormatConsumed);
-                                ma_uint64 convertedFrameCountDevice = mappedDeviceBufferFramesRemainingPlayback;
-                                void* pConvertedFramesClient = outputDataInClientFormat + (outputDataInClientFormatConsumed * bpfPlaybackClient);
-                                void* pConvertedFramesDevice = pRunningDeviceBufferPlayback;
-                                result = ma_data_converter_process_pcm_frames(&pDevice->playback.converter, pConvertedFramesClient, &convertedFrameCountClient, pConvertedFramesDevice, &convertedFrameCountDevice);
-                                if (result != MA_SUCCESS) {
-                                    break;
-                                }
-
-                                outputDataInClientFormatConsumed          += (ma_uint32)convertedFrameCountClient;  /* Safe cast. */
-                                mappedDeviceBufferFramesRemainingPlayback -= (ma_uint32)convertedFrameCountDevice;  /* Safe cast. */
-
-                                if (mappedDeviceBufferFramesRemainingPlayback == 0) {
-                                    break;
-                                }
-                            }
-
-                            /*
-                            Getting here means we need to fire the callback. If format conversion is unnecessary, we can optimize this by passing the pointers to the internal
-                            buffers directly to the callback.
-                            */
-                            if (pDevice->capture.converter.isPassthrough && pDevice->playback.converter.isPassthrough) {
-                                /* Optimal path. We can pass mapped pointers directly to the callback. */
-                                framesToProcess = ma_min(mappedDeviceBufferFramesRemainingCapture, mappedDeviceBufferFramesRemainingPlayback);
-                                framesProcessed = framesToProcess;
-
-                                ma_device__handle_data_callback(pDevice, pRunningDeviceBufferPlayback, pRunningDeviceBufferCapture, framesToProcess);
-
-                                mappedDeviceBufferFramesRemainingCapture  -= framesProcessed;
-                                mappedDeviceBufferFramesRemainingPlayback -= framesProcessed;
-
-                                if (mappedDeviceBufferFramesRemainingCapture == 0) {
-                                    break;  /* Exhausted input data. */
-                                }
-                                if (mappedDeviceBufferFramesRemainingPlayback == 0) {
-                                    break;  /* Exhausted output data. */
-                                }
-                            } else if (pDevice->capture.converter.isPassthrough) {
-                                /* The input buffer is a passthrough, but the playback buffer requires a conversion. */
-                                framesToProcess = ma_min(mappedDeviceBufferFramesRemainingCapture, outputDataInClientFormatCap);
-                                framesProcessed = framesToProcess;
-
-                                ma_device__handle_data_callback(pDevice, outputDataInClientFormat, pRunningDeviceBufferCapture, framesToProcess);
-                                outputDataInClientFormatCount    = framesProcessed;
-                                outputDataInClientFormatConsumed = 0;
-
-                                mappedDeviceBufferFramesRemainingCapture -= framesProcessed;
-                                if (mappedDeviceBufferFramesRemainingCapture == 0) {
-                                    break;  /* Exhausted input data. */
-                                }
-                            } else if (pDevice->playback.converter.isPassthrough) {
-                                /* The input buffer requires conversion, the playback buffer is passthrough. */
-                                ma_uint64 capturedDeviceFramesToProcess = mappedDeviceBufferFramesRemainingCapture;
-                                ma_uint64 capturedClientFramesToProcess = ma_min(inputDataInClientFormatCap, mappedDeviceBufferFramesRemainingPlayback);
-
-                                result = ma_data_converter_process_pcm_frames(&pDevice->capture.converter, pRunningDeviceBufferCapture, &capturedDeviceFramesToProcess, inputDataInClientFormat, &capturedClientFramesToProcess);
-                                if (result != MA_SUCCESS) {
-                                    break;
-                                }
-
-                                if (capturedClientFramesToProcess == 0) {
-                                    break;
-                                }
-
-                                ma_device__handle_data_callback(pDevice, pRunningDeviceBufferPlayback, inputDataInClientFormat, (ma_uint32)capturedClientFramesToProcess);   /* Safe cast. */
-
-                                mappedDeviceBufferFramesRemainingCapture  -= (ma_uint32)capturedDeviceFramesToProcess;
-                                mappedDeviceBufferFramesRemainingPlayback -= (ma_uint32)capturedClientFramesToProcess;
-                            } else {
-                                ma_uint64 capturedDeviceFramesToProcess = mappedDeviceBufferFramesRemainingCapture;
-                                ma_uint64 capturedClientFramesToProcess = ma_min(inputDataInClientFormatCap, outputDataInClientFormatCap);
-
-                                result = ma_data_converter_process_pcm_frames(&pDevice->capture.converter, pRunningDeviceBufferCapture, &capturedDeviceFramesToProcess, inputDataInClientFormat, &capturedClientFramesToProcess);
-                                if (result != MA_SUCCESS) {
-                                    break;
-                                }
-
-                                if (capturedClientFramesToProcess == 0) {
-                                    break;
-                                }
-
-                                ma_device__handle_data_callback(pDevice, outputDataInClientFormat, inputDataInClientFormat, (ma_uint32)capturedClientFramesToProcess);
-
-                                mappedDeviceBufferFramesRemainingCapture -= (ma_uint32)capturedDeviceFramesToProcess;
-                                outputDataInClientFormatCount             = (ma_uint32)capturedClientFramesToProcess;
-                                outputDataInClientFormatConsumed          = 0;
-                            }
-                        }
-
-
-                        /* If at this point we've run out of capture data we need to release the buffer. */
-                        if (mappedDeviceBufferFramesRemainingCapture == 0 && pMappedDeviceBufferCapture != NULL) {
-                            hr = ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, mappedDeviceBufferSizeInFramesCapture);
-                            if (FAILED(hr)) {
-                                ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to release internal buffer from capture device after reading from the device.");
-                                exitLoop = MA_TRUE;
-                                break;
-                            }
-
-                            pMappedDeviceBufferCapture = NULL;
-                            mappedDeviceBufferFramesRemainingCapture = 0;
-                            mappedDeviceBufferSizeInFramesCapture    = 0;
-                        }
-
-                        /* Get out of this loop if we're run out of room in the playback buffer. */
-                        if (mappedDeviceBufferFramesRemainingPlayback == 0) {
-                            break;
-                        }
-                    }
-                }
-
-
-                /* If at this point we've run out of data we need to release the buffer. */
-                if (mappedDeviceBufferFramesRemainingPlayback == 0 && pMappedDeviceBufferPlayback != NULL) {
-                    hr = ma_IAudioRenderClient_ReleaseBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, mappedDeviceBufferSizeInFramesPlayback, 0);
-                    if (FAILED(hr)) {
-                        ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to release internal buffer from playback device after writing to the device.");
-                        exitLoop = MA_TRUE;
-                        break;
-                    }
-
-                    framesWrittenToPlaybackDevice += mappedDeviceBufferSizeInFramesPlayback;
-
-                    pMappedDeviceBufferPlayback = NULL;
-                    mappedDeviceBufferFramesRemainingPlayback = 0;
-                    mappedDeviceBufferSizeInFramesPlayback    = 0;
-                }
-
-                if (!c89atomic_load_32(&pDevice->wasapi.isStartedPlayback)) {
-                    ma_uint32 startThreshold = pDevice->playback.internalPeriodSizeInFrames * 1;
-
-                    /* Prevent a deadlock. If we don't clamp against the actual buffer size we'll never end up starting the playback device which will result in a deadlock. */
-                    if (startThreshold > pDevice->wasapi.actualPeriodSizeInFramesPlayback) {
-                        startThreshold = pDevice->wasapi.actualPeriodSizeInFramesPlayback;
-                    }
-
-                    if (pDevice->playback.shareMode == ma_share_mode_exclusive || framesWrittenToPlaybackDevice >= startThreshold) {
-                        hr = ma_IAudioClient_Start((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback);
-                        if (FAILED(hr)) {
-                            ma_IAudioClient_Stop((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture);
-                            ma_IAudioClient_Reset((ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture);
-                            ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to start internal playback device.");
-                            return ma_result_from_HRESULT(hr);
-                        }
-
-                        c89atomic_exchange_32(&pDevice->wasapi.isStartedPlayback, MA_TRUE);
-                    }
-                }
-
-                /* Make sure the device has started before waiting. */
-                if (WaitForSingleObject(pDevice->wasapi.hEventPlayback, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
-                    return MA_ERROR;   /* Wait failed. */
-                }
-            } break;
-
-
-
-            case ma_device_type_capture:
-            case ma_device_type_loopback:
-            {
-                ma_uint32 framesAvailableCapture;
-                DWORD flagsCapture;    /* Passed to IAudioCaptureClient_GetBuffer(). */
-
-                /* Wait for data to become available first. */
-                if (WaitForSingleObject(pDevice->wasapi.hEventCapture, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
-                    /*
-                    For capture we can terminate here because it probably means the microphone just isn't delivering data for whatever reason, but
-                    for loopback is most likely means nothing is actually playing. We want to keep trying in this situation.
-                    */
-                    if (pDevice->type == ma_device_type_loopback) {
-                        continue;   /* Keep waiting in loopback mode. */
-                    } else {
-                        exitLoop = MA_TRUE;
-                        break;      /* Wait failed. */
-                    }
-                }
-
-                /* See how many frames are available. Since we waited at the top, I don't think this should ever return 0. I'm checking for this anyway. */
-                result = ma_device__get_available_frames__wasapi(pDevice, (ma_IAudioClient*)pDevice->wasapi.pAudioClientCapture, &framesAvailableCapture);
-                if (result != MA_SUCCESS) {
-                    exitLoop = MA_TRUE;
-                    break;
-                }
-
-                if (framesAvailableCapture < pDevice->wasapi.periodSizeInFramesCapture) {
-                    continue;   /* Nothing available. Keep waiting. */
-                }
-
-                /* Map the data buffer in preparation for sending to the client. */
-                mappedDeviceBufferSizeInFramesCapture = framesAvailableCapture;
-                hr = ma_IAudioCaptureClient_GetBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, (BYTE**)&pMappedDeviceBufferCapture, &mappedDeviceBufferSizeInFramesCapture, &flagsCapture, NULL, NULL);
-                if (FAILED(hr)) {
-                    ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from capture device in preparation for writing to the device.");
-                    exitLoop = MA_TRUE;
-                    break;
-                }
+            /* First just ask WASAPI for a data buffer. If it's not available, we'll wait for more. */
+            hr = ma_IAudioCaptureClient_GetBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, (BYTE**)&pDevice->wasapi.pMappedBufferCapture, &pDevice->wasapi.mappedBufferCaptureCap, &flags, NULL, NULL);
+            if (hr == S_OK) {
+                /* We got a data buffer. Continue to the next loop iteration which will then read from the mapped pointer. */
 
                 /* Overrun detection. */
-                if ((flagsCapture & MA_AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
+                if ((flags & MA_AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
                     /* Glitched. Probably due to an overrun. */
-                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Data discontinuity (possible overrun). framesAvailableCapture=%d, mappedBufferSizeInFramesCapture=%d\n", framesAvailableCapture, mappedDeviceBufferSizeInFramesCapture);
+                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Data discontinuity (possible overrun). Attempting recovery. mappedBufferCaptureCap=%d\n", pDevice->wasapi.mappedBufferCaptureCap);
 
                     /*
-                    Exeriment: If we get an overrun it probably means we're straddling the end of the buffer. In order to prevent a never-ending sequence of glitches let's experiment
-                    by dropping every frame until we're left with only a single period. To do this we just keep retrieving and immediately releasing buffers until we're down to the
-                    last period.
+                    If we got an overrun it probably means we're straddling the end of the buffer. In order to prevent
+                    a never-ending sequence of glitches we're going to recover by completely clearing out the capture
+                    buffer.
                     */
-                    if (framesAvailableCapture >= pDevice->wasapi.actualPeriodSizeInFramesCapture) {
-                        ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Synchronizing capture stream. ");
-                        do
-                        {
-                            hr = ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, mappedDeviceBufferSizeInFramesCapture);
+                    {
+                        ma_uint32 iterationCount = 4;   /* Safety to prevent an infinite loop. */
+                        ma_uint32 i;
+
+                        for (i = 0; i < iterationCount; i += 1) {
+                            hr = ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, pDevice->wasapi.mappedBufferCaptureCap);
                             if (FAILED(hr)) {
                                 break;
                             }
 
-                            framesAvailableCapture -= mappedDeviceBufferSizeInFramesCapture;
-
-                            if (framesAvailableCapture > 0) {
-                                mappedDeviceBufferSizeInFramesCapture = ma_min(framesAvailableCapture, periodSizeInFramesCapture);
-                                hr = ma_IAudioCaptureClient_GetBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, (BYTE**)&pMappedDeviceBufferCapture, &mappedDeviceBufferSizeInFramesCapture, &flagsCapture, NULL, NULL);
-                                if (FAILED(hr)) {
-                                    ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from capture device in preparation for writing to the device.");
-                                    exitLoop = MA_TRUE;
-                                    break;
-                                }
-                            } else {
-                                pMappedDeviceBufferCapture = NULL;
-                                mappedDeviceBufferSizeInFramesCapture = 0;
+                            hr = ma_IAudioCaptureClient_GetBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, (BYTE**)&pDevice->wasapi.pMappedBufferCapture, &pDevice->wasapi.mappedBufferCaptureCap, &flags, NULL, NULL);
+                            if (hr == MA_AUDCLNT_S_BUFFER_EMPTY || FAILED(hr)) {
+                                break;
                             }
-                        } while (framesAvailableCapture > periodSizeInFramesCapture);
-                        ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "framesAvailableCapture=%d, mappedBufferSizeInFramesCapture=%d\n", framesAvailableCapture, mappedDeviceBufferSizeInFramesCapture);
+                        }
                     }
+
+                    /* We should not have a valid buffer at this point so make sure everything is empty. */
+                    pDevice->wasapi.pMappedBufferCapture   = NULL;
+                    pDevice->wasapi.mappedBufferCaptureCap = 0;
+                    pDevice->wasapi.mappedBufferCaptureLen = 0;
                 } else {
-                    if (flagsCapture != 0) {
-                        ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Capture Flags: %ld\n", flagsCapture);
+                    /* The data is clean. */
+                    pDevice->wasapi.mappedBufferCaptureLen = pDevice->wasapi.mappedBufferCaptureCap;
+
+                    if (flags != 0) {
+                        ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "[WASAPI] Capture Flags: %ld\n", flags);
                     }
                 }
 
-                /* We should have a buffer at this point, but let's just do a sanity check anyway. */
-                if (mappedDeviceBufferSizeInFramesCapture > 0 && pMappedDeviceBufferCapture != NULL) {
-                    ma_device__send_frames_to_client(pDevice, mappedDeviceBufferSizeInFramesCapture, pMappedDeviceBufferCapture);
-
-                    /* At this point we're done with the buffer. */
-                    hr = ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, mappedDeviceBufferSizeInFramesCapture);
-                    pMappedDeviceBufferCapture = NULL;    /* <-- Important. Not doing this can result in an error once we leave this loop because it will use this to know whether or not a final ReleaseBuffer() needs to be called. */
-                    mappedDeviceBufferSizeInFramesCapture = 0;
-                    if (FAILED(hr)) {
-                        ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to release internal buffer from capture device after reading from the device.");
-                        exitLoop = MA_TRUE;
-                        break;
+                continue;
+            } else {
+                if (hr == MA_AUDCLNT_S_BUFFER_EMPTY || hr == MA_AUDCLNT_E_BUFFER_ERROR) {
+                    /*
+                    No data is available. We need to wait for more. There's two situations to consider
+                    here. The first is normal capture mode. If this times out it probably means the
+                    microphone isn't delivering data for whatever reason. In this case we'll just
+                    abort the read and return whatever we were able to get. The other situations is
+                    loopback mode, in which case a timeout probably just means the nothing is playing
+                    through the speakers. 
+                    */
+                    if (WaitForSingleObject(pDevice->wasapi.hEventCapture, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
+                        if (pDevice->type == ma_device_type_loopback) {
+                            continue;   /* Keep waiting in loopback mode. */
+                        } else {
+                            result = MA_ERROR;
+                            break;      /* Wait failed. */
+                        }
                     }
-                }
-            } break;
 
-
-
-            case ma_device_type_playback:
-            {
-                ma_uint32 framesAvailablePlayback;
-
-                /* Check how much space is available. If this returns 0 we just keep waiting. */
-                result = ma_device__get_available_frames__wasapi(pDevice, (ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback, &framesAvailablePlayback);
-                if (result != MA_SUCCESS) {
-                    exitLoop = MA_TRUE;
+                    /* At this point we should be able to loop back to the start of the loop and try retrieving a data buffer again. */
+                } else {
+                    /* An error occured and we need to abort. */
+                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from capture device in preparation for reading from the device. HRESULT = %d. Stopping device.\n", (int)hr);
+                    result = ma_result_from_HRESULT(hr);
                     break;
                 }
-
-                if (framesAvailablePlayback >= pDevice->wasapi.periodSizeInFramesPlayback) {
-                    /* Map a the data buffer in preparation for the callback. */
-                    hr = ma_IAudioRenderClient_GetBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, framesAvailablePlayback, &pMappedDeviceBufferPlayback);
-                    if (FAILED(hr)) {
-                        ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from playback device in preparation for writing to the device.");
-                        exitLoop = MA_TRUE;
-                        break;
-                    }
-
-                    /* We should have a buffer at this point. */
-                    ma_device__read_frames_from_client(pDevice, framesAvailablePlayback, pMappedDeviceBufferPlayback);
-
-                    /* At this point we're done writing to the device and we just need to release the buffer. */
-                    hr = ma_IAudioRenderClient_ReleaseBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, framesAvailablePlayback, 0);
-                    pMappedDeviceBufferPlayback = NULL;    /* <-- Important. Not doing this can result in an error once we leave this loop because it will use this to know whether or not a final ReleaseBuffer() needs to be called. */
-                    mappedDeviceBufferSizeInFramesPlayback = 0;
-
-                    if (FAILED(hr)) {
-                        ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to release internal buffer from playback device after writing to the device.");
-                        exitLoop = MA_TRUE;
-                        break;
-                    }
-
-                    framesWrittenToPlaybackDevice += framesAvailablePlayback;
-                }
-
-                if (!c89atomic_load_32(&pDevice->wasapi.isStartedPlayback)) {
-                    hr = ma_IAudioClient_Start((ma_IAudioClient*)pDevice->wasapi.pAudioClientPlayback);
-                    if (FAILED(hr)) {
-                        ma_log_post(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to start internal playback device.");
-                        exitLoop = MA_TRUE;
-                        break;
-                    }
-
-                    c89atomic_exchange_32(&pDevice->wasapi.isStartedPlayback, MA_TRUE);
-                }
-
-                /* Make sure we don't wait on the event before we've started the device or we may end up deadlocking. */
-                if (WaitForSingleObject(pDevice->wasapi.hEventPlayback, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
-                    exitLoop = MA_TRUE;
-                    break;   /* Wait failed. Probably timed out. */
-                }
-            } break;
-
-            default: return MA_INVALID_ARGS;
+            }
         }
     }
 
-    /* Here is where the device needs to be stopped. */
-    if (pDevice->type == ma_device_type_capture || pDevice->type == ma_device_type_duplex || pDevice->type == ma_device_type_loopback) {
-        /* Any mapped buffers need to be released. */
-        if (pMappedDeviceBufferCapture != NULL) {
-            hr = ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, mappedDeviceBufferSizeInFramesCapture);
+    /*
+    If we were unable to process the entire requested frame count, but we still have a mapped buffer,
+    there's a good chance either an error occurred or the device was stopped mid-read. In this case
+    we'll need to make sure the buffer is released.
+    */
+    if (totalFramesProcessed < frameCount && pDevice->wasapi.pMappedBufferCapture != NULL) {
+        ma_IAudioCaptureClient_ReleaseBuffer((ma_IAudioCaptureClient*)pDevice->wasapi.pCaptureClient, pDevice->wasapi.mappedBufferCaptureCap);
+        pDevice->wasapi.pMappedBufferCapture   = NULL;
+        pDevice->wasapi.mappedBufferCaptureCap = 0;
+        pDevice->wasapi.mappedBufferCaptureLen = 0;
+    }
+
+    if (pFramesRead != NULL) {
+        *pFramesRead = totalFramesProcessed;
+    }
+
+    return result;
+}
+
+static ma_result ma_device_write__wasapi(ma_device* pDevice, const void* pFrames, ma_uint32 frameCount, ma_uint32* pFramesWritten)
+{
+    ma_result result = MA_SUCCESS;
+    ma_uint32 totalFramesProcessed = 0;
+
+    /* Keep writing to the device until it's stopped or we've consumed all of our input. */
+    while (ma_device_get_state(pDevice) == ma_device_state_started && totalFramesProcessed < frameCount) {
+        ma_uint32 framesRemaining = frameCount - totalFramesProcessed;
+
+        /*
+        We're going to do this in a similar way to capture. We'll first check if the cached data pointer
+        is valid, and if so, read from that. Otherwise We will call IAudioRenderClient_GetBuffer() with
+        a requested buffer size equal to our actual period size. If it returns AUDCLNT_E_BUFFER_TOO_LARGE
+        it means we need to wait for some data to become available.
+        */
+        if (pDevice->wasapi.pMappedBufferPlayback != NULL) {
+            /* We still have some space available in the mapped data buffer. Write to it. */
+            ma_uint32 framesToProcessNow = framesRemaining;
+            if (framesToProcessNow > (pDevice->wasapi.mappedBufferPlaybackCap - pDevice->wasapi.mappedBufferPlaybackLen)) {
+                framesToProcessNow = (pDevice->wasapi.mappedBufferPlaybackCap - pDevice->wasapi.mappedBufferPlaybackLen);
+            }
+
+            /* Now just copy the data over to the output buffer. */
+            ma_copy_pcm_frames(
+                ma_offset_pcm_frames_ptr(pDevice->wasapi.pMappedBufferPlayback, pDevice->wasapi.mappedBufferPlaybackLen, pDevice->playback.internalFormat, pDevice->playback.internalChannels),
+                ma_offset_pcm_frames_const_ptr(pFrames, totalFramesProcessed, pDevice->playback.internalFormat, pDevice->playback.internalChannels),
+                framesToProcessNow,
+                pDevice->playback.internalFormat, pDevice->playback.internalChannels
+            );
+
+            totalFramesProcessed                    += framesToProcessNow;
+            pDevice->wasapi.mappedBufferPlaybackLen += framesToProcessNow;
+
+            /* If the data buffer has been fully consumed we need to release it. */
+            if (pDevice->wasapi.mappedBufferPlaybackLen == pDevice->wasapi.mappedBufferPlaybackCap) {
+                ma_IAudioRenderClient_ReleaseBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, pDevice->wasapi.mappedBufferPlaybackCap, 0);
+                pDevice->wasapi.pMappedBufferPlayback   = NULL;
+                pDevice->wasapi.mappedBufferPlaybackCap = 0;
+                pDevice->wasapi.mappedBufferPlaybackLen = 0;
+
+                /*
+                In exclusive mode we need to wait here. Exclusive mode is weird because GetBuffer() never
+                seems to return AUDCLNT_E_BUFFER_TOO_LARGE, which is what we normally use to determine
+                whether or not we need to wait for more data.
+                */
+                if (pDevice->playback.shareMode == ma_share_mode_exclusive) {
+                    if (WaitForSingleObject(pDevice->wasapi.hEventPlayback, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
+                        result = MA_ERROR;
+                        break;   /* Wait failed. Probably timed out. */
+                    }
+                }
+            }
+        } else {
+            /* We don't have a mapped data buffer so we'll need to get one. */
+            HRESULT hr;
+            ma_uint32 bufferSizeInFrames;
+
+            /* Special rules for exclusive mode. */
+            if (pDevice->playback.shareMode == ma_share_mode_exclusive) {
+                bufferSizeInFrames = pDevice->wasapi.actualBufferSizeInFramesPlayback;
+            } else {
+                bufferSizeInFrames = pDevice->wasapi.periodSizeInFramesPlayback;
+            }
+
+            hr = ma_IAudioRenderClient_GetBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, bufferSizeInFrames, (BYTE**)&pDevice->wasapi.pMappedBufferPlayback);
+            if (hr == S_OK) {
+                /* We have data available. */
+                pDevice->wasapi.mappedBufferPlaybackCap = bufferSizeInFrames;
+                pDevice->wasapi.mappedBufferPlaybackLen = 0;
+            } else {
+                if (hr == MA_AUDCLNT_E_BUFFER_TOO_LARGE || hr == MA_AUDCLNT_E_BUFFER_ERROR) {
+                    /* Not enough data available. We need to wait for more. */
+                    if (WaitForSingleObject(pDevice->wasapi.hEventPlayback, MA_WASAPI_WAIT_TIMEOUT_MILLISECONDS) != WAIT_OBJECT_0) {
+                        result = MA_ERROR;
+                        break;   /* Wait failed. Probably timed out. */
+                    }
+                } else {
+                    /* Some error occurred. We'll need to abort. */
+                    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[WASAPI] Failed to retrieve internal buffer from playback device in preparation for writing to the device. HRESULT = %d. Stopping device.\n", (int)hr);
+                    result = ma_result_from_HRESULT(hr);
+                    break;
+                }
+            }
         }
     }
 
-    if (pDevice->type == ma_device_type_playback || pDevice->type == ma_device_type_duplex) {
-        /* Any mapped buffers need to be released. */
-        if (pMappedDeviceBufferPlayback != NULL) {
-            hr = ma_IAudioRenderClient_ReleaseBuffer((ma_IAudioRenderClient*)pDevice->wasapi.pRenderClient, mappedDeviceBufferSizeInFramesPlayback, 0);
-        }
+    if (pFramesWritten != NULL) {
+        *pFramesWritten = totalFramesProcessed;
     }
 
-    return MA_SUCCESS;
+    return result;
 }
 
 static ma_result ma_device_data_loop_wakeup__wasapi(ma_device* pDevice)
@@ -10747,9 +11267,9 @@ static ma_result ma_context_init__wasapi(ma_context* pContext, const ma_context_
     pCallbacks->onDeviceUninit            = ma_device_uninit__wasapi;
     pCallbacks->onDeviceStart             = ma_device_start__wasapi;
     pCallbacks->onDeviceStop              = ma_device_stop__wasapi;
-    pCallbacks->onDeviceRead              = NULL;                   /* Not used. Reading is done manually in the audio thread. */
-    pCallbacks->onDeviceWrite             = NULL;                   /* Not used. Writing is done manually in the audio thread. */
-    pCallbacks->onDeviceDataLoop          = ma_device_data_loop__wasapi;
+    pCallbacks->onDeviceRead              = ma_device_read__wasapi;
+    pCallbacks->onDeviceWrite             = ma_device_write__wasapi;
+    pCallbacks->onDeviceDataLoop          = NULL;
     pCallbacks->onDeviceDataLoopWakeup    = ma_device_data_loop_wakeup__wasapi;
 
     return MA_SUCCESS;
@@ -13045,7 +13565,7 @@ static ma_result ma_device_init__winmm(ma_device* pDevice, const ma_device_confi
         MMRESULT resultMM;
 
         /* We use an event to know when a new fragment needs to be enqueued. */
-        pDevice->winmm.hEventPlayback = (ma_handle)CreateEvent(NULL, TRUE, TRUE, NULL);
+        pDevice->winmm.hEventPlayback = (ma_handle)CreateEventW(NULL, TRUE, TRUE, NULL);
         if (pDevice->winmm.hEventPlayback == NULL) {
             errorMsg = "[WinMM] Failed to create event for fragment enqueing for the playback device.", errorCode = ma_result_from_GetLastError(GetLastError());
             goto on_error;
@@ -17404,15 +17924,25 @@ static ma_result ma_device_init__pulse(ma_device* pDevice, const ma_device_confi
             goto on_error2;
         }
 
+
         /* Internal format. */
         pActualSS = ((ma_pa_stream_get_sample_spec_proc)pDevice->pContext->pulse.pa_stream_get_sample_spec)((ma_pa_stream*)pDevice->pulse.pStreamCapture);
         if (pActualSS != NULL) {
             ss = *pActualSS;
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[PulseAudio] Capture sample spec: format=%s, channels=%d, rate=%d\n", ma_get_format_name(ma_format_from_pulse(ss.format)), ss.channels, ss.rate);
+        } else {
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[PulseAudio] Failed to retrieve capture sample spec.\n");
         }
 
         pDescriptorCapture->format     = ma_format_from_pulse(ss.format);
         pDescriptorCapture->channels   = ss.channels;
         pDescriptorCapture->sampleRate = ss.rate;
+
+        if (pDescriptorCapture->format == ma_format_unknown || pDescriptorCapture->channels == 0 || pDescriptorCapture->sampleRate == 0) {
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[PulseAudio] Capture sample spec is invalid. Device unusable by miniaudio. format=%s, channels=%d, sampleRate=%d.\n", ma_get_format_name(pDescriptorCapture->format), pDescriptorCapture->channels, pDescriptorCapture->sampleRate);
+            result = MA_ERROR;
+            goto on_error4;
+        }
 
         /* Internal channel map. */
         pActualCMap = ((ma_pa_stream_get_channel_map_proc)pDevice->pContext->pulse.pa_stream_get_channel_map)((ma_pa_stream*)pDevice->pulse.pStreamCapture);
@@ -17431,9 +17961,13 @@ static ma_result ma_device_init__pulse(ma_device* pDevice, const ma_device_confi
             attr = *pActualAttr;
         }
 
-        pDescriptorCapture->periodCount        = attr.maxlength / attr.fragsize;
-        pDescriptorCapture->periodSizeInFrames = attr.maxlength / ma_get_bytes_per_frame(pDescriptorCapture->format, pDescriptorCapture->channels) / pDescriptorCapture->periodCount;
+        if (attr.fragsize > 0) {
+            pDescriptorPlayback->periodCount = ma_max(attr.maxlength / attr.fragsize, 1);
+        } else {
+            pDescriptorPlayback->periodCount = 1;
+        }
 
+        pDescriptorCapture->periodSizeInFrames = attr.maxlength / ma_get_bytes_per_frame(pDescriptorCapture->format, pDescriptorCapture->channels) / pDescriptorCapture->periodCount;
         ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[PulseAudio] Capture actual attr: maxlength=%d, tlength=%d, prebuf=%d, minreq=%d, fragsize=%d; periodSizeInFrames=%d\n", attr.maxlength, attr.tlength, attr.prebuf, attr.minreq, attr.fragsize, pDescriptorCapture->periodSizeInFrames);
     }
 
@@ -17515,11 +18049,20 @@ static ma_result ma_device_init__pulse(ma_device* pDevice, const ma_device_confi
         pActualSS = ((ma_pa_stream_get_sample_spec_proc)pDevice->pContext->pulse.pa_stream_get_sample_spec)((ma_pa_stream*)pDevice->pulse.pStreamPlayback);
         if (pActualSS != NULL) {
             ss = *pActualSS;
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[PulseAudio] Playback sample spec: format=%s, channels=%d, rate=%d\n", ma_get_format_name(ma_format_from_pulse(ss.format)), ss.channels, ss.rate);
+        } else {
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[PulseAudio] Failed to retrieve playback sample spec.\n");
         }
 
         pDescriptorPlayback->format     = ma_format_from_pulse(ss.format);
         pDescriptorPlayback->channels   = ss.channels;
         pDescriptorPlayback->sampleRate = ss.rate;
+
+        if (pDescriptorPlayback->format == ma_format_unknown || pDescriptorPlayback->channels == 0 || pDescriptorPlayback->sampleRate == 0) {
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_ERROR, "[PulseAudio] Playback sample spec is invalid. Device unusable by miniaudio. format=%s, channels=%d, sampleRate=%d.\n", ma_get_format_name(pDescriptorPlayback->format), pDescriptorPlayback->channels, pDescriptorPlayback->sampleRate);
+            result = MA_ERROR;
+            goto on_error4;
+        }
 
         /* Internal channel map. */
         pActualCMap = ((ma_pa_stream_get_channel_map_proc)pDevice->pContext->pulse.pa_stream_get_channel_map)((ma_pa_stream*)pDevice->pulse.pStreamPlayback);
@@ -17538,7 +18081,12 @@ static ma_result ma_device_init__pulse(ma_device* pDevice, const ma_device_confi
             attr = *pActualAttr;
         }
 
-        pDescriptorPlayback->periodCount        = ma_max(attr.maxlength / attr.tlength, 1);
+        if (attr.tlength > 0) {
+            pDescriptorPlayback->periodCount = ma_max(attr.maxlength / attr.tlength, 1);
+        } else {
+            pDescriptorPlayback->periodCount = 1;
+        }
+
         pDescriptorPlayback->periodSizeInFrames = attr.maxlength / ma_get_bytes_per_frame(pDescriptorPlayback->format, pDescriptorPlayback->channels) / pDescriptorPlayback->periodCount;
         ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[PulseAudio] Playback actual attr: maxlength=%d, tlength=%d, prebuf=%d, minreq=%d, fragsize=%d; internalPeriodSizeInFrames=%d\n", attr.maxlength, attr.tlength, attr.prebuf, attr.minreq, attr.fragsize, pDescriptorPlayback->periodSizeInFrames);
     }
@@ -20492,13 +21040,12 @@ static void on_start_stop__coreaudio(void* pUserData, AudioUnit audioUnit, Audio
     */
     if (ma_device_get_state(pDevice) == ma_device_state_uninitialized || ma_device_get_state(pDevice) == ma_device_state_stopping || ma_device_get_state(pDevice) == ma_device_state_stopped) {
         ma_device__on_notification_stopped(pDevice);
-        ma_event_signal(&pDevice->coreaudio.stopEvent);
     } else {
         UInt32 isRunning;
         UInt32 isRunningSize = sizeof(isRunning);
         OSStatus status = ((ma_AudioUnitGetProperty_proc)pDevice->pContext->coreaudio.AudioUnitGetProperty)(audioUnit, kAudioOutputUnitProperty_IsRunning, scope, element, &isRunning, &isRunningSize);
         if (status != noErr) {
-            return; /* Don't really know what to do in this case... just ignore it, I suppose... */
+            goto done; /* Don't really know what to do in this case... just ignore it, I suppose... */
         }
 
         if (!isRunning) {
@@ -20520,7 +21067,7 @@ static void on_start_stop__coreaudio(void* pUserData, AudioUnit audioUnit, Audio
                 */
                 if (((audioUnit == pDevice->coreaudio.audioUnitPlayback) && pDevice->coreaudio.isSwitchingPlaybackDevice) ||
                     ((audioUnit == pDevice->coreaudio.audioUnitCapture)  && pDevice->coreaudio.isSwitchingCaptureDevice)) {
-                    return;
+                    goto done;
                 }
 
                 /*
@@ -20530,7 +21077,7 @@ static void on_start_stop__coreaudio(void* pUserData, AudioUnit audioUnit, Audio
 
                 TODO: Try to predict if Core Audio will switch devices. If not, the stopped callback needs to be posted.
                 */
-                return;
+                goto done;
             }
 
             /* Getting here means we need to stop the device. */
@@ -20539,6 +21086,10 @@ static void on_start_stop__coreaudio(void* pUserData, AudioUnit audioUnit, Audio
     }
 
     (void)propertyID; /* Unused. */
+
+done:
+    /* Always signal the stop event. It's possible for the "else" case to get hit which can happen during an interruption. */
+    ma_event_signal(&pDevice->coreaudio.stopEvent);
 }
 
 #if defined(MA_APPLE_DESKTOP)
@@ -20795,6 +21346,17 @@ static ma_result ma_device__untrack__coreaudio(ma_device* pDevice)
         case AVAudioSessionInterruptionTypeBegan:
         {
             ma_log_postf(ma_device_get_log(m_pDevice), MA_LOG_LEVEL_INFO, "[Core Audio] Interruption: AVAudioSessionInterruptionTypeBegan\n");
+
+            /*
+            Core Audio will have stopped the internal device automatically, but we need explicitly
+            stop it at a higher level to ensure miniaudio-specific state is updated for consistency.
+            */
+            ma_device_stop(m_pDevice);
+
+            /*
+            Fire the notification after the device has been stopped to ensure it's in the correct
+            state when the notification handler is invoked.
+            */
             ma_device__on_notification_interruption_began(m_pDevice);
         } break;
         
@@ -24383,7 +24945,22 @@ static void ma_stream_error_callback__aaudio(ma_AAudioStream* pStream, void* pUs
     to do it from another thread. Therefore we are going to use an event thread for the AAudio backend to do this cleanly and safely.
     */
     if (((MA_PFN_AAudioStream_getState)pDevice->pContext->aaudio.AAudioStream_getState)(pStream) == MA_AAUDIO_STREAM_STATE_DISCONNECTED) {
-        ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[AAudio] Device Disconnected.\n");
+        /* We need to post a job to the job thread for processing. This will reroute the device by reinitializing the stream. */
+        ma_result result;
+        ma_job job = ma_job_init(MA_JOB_TYPE_DEVICE_AAUDIO_REROUTE);
+        job.data.device.aaudio.reroute.pDevice = pDevice;
+
+        if (pStream == pDevice->aaudio.pStreamCapture) {
+            job.data.device.aaudio.reroute.deviceType = ma_device_type_capture;
+        } else {
+            job.data.device.aaudio.reroute.deviceType = ma_device_type_playback;
+        }
+
+        result = ma_device_job_thread_post(&pDevice->pContext->aaudio.jobThread, &job);
+        if (result != MA_SUCCESS) {
+            ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_INFO, "[AAudio] Device Disconnected. Failed to post job for rerouting.\n");
+            return;
+        }
     }
 }
 
@@ -24746,6 +25323,11 @@ static ma_result ma_device_init__aaudio(ma_device* pDevice, const ma_device_conf
         return MA_DEVICE_TYPE_NOT_SUPPORTED;
     }
 
+    pDevice->aaudio.usage                   = pConfig->aaudio.usage;
+    pDevice->aaudio.contentType             = pConfig->aaudio.contentType;
+    pDevice->aaudio.inputPreset             = pConfig->aaudio.inputPreset;
+    pDevice->aaudio.noAutoStartAfterReroute = pConfig->aaudio.noAutoStartAfterReroute;
+
     if (pConfig->deviceType == ma_device_type_capture || pConfig->deviceType == ma_device_type_duplex) {
         result = ma_device_init_by_type__aaudio(pDevice, pConfig, ma_device_type_capture, pDescriptorCapture, (ma_AAudioStream**)&pDevice->aaudio.pStreamCapture);
         if (result != MA_SUCCESS) {
@@ -24809,6 +25391,10 @@ static ma_result ma_device_stop_stream__aaudio(ma_device* pDevice, ma_AAudioStre
 
     This maps with miniaudio's requirement that device's be drained which means we don't need to implement any draining logic.
     */
+    currentState = ((MA_PFN_AAudioStream_getState)pDevice->pContext->aaudio.AAudioStream_getState)(pStream);
+    if (currentState == MA_AAUDIO_STREAM_STATE_DISCONNECTED) {
+        return MA_SUCCESS;  /* The device is disconnected. Don't try stopping it. */
+    }
 
     resultAA = ((MA_PFN_AAudioStream_requestStop)pDevice->pContext->aaudio.AAudioStream_requestStop)(pStream);
     if (resultAA != MA_AAUDIO_OK) {
@@ -24880,6 +25466,99 @@ static ma_result ma_device_stop__aaudio(ma_device* pDevice)
     return MA_SUCCESS;
 }
 
+static ma_result ma_device_reinit__aaudio(ma_device* pDevice, ma_device_type deviceType)
+{
+    ma_result result;
+
+    MA_ASSERT(pDevice != NULL);
+
+    /* The first thing to do is close the streams. */
+    if (deviceType == ma_device_type_capture || deviceType == ma_device_type_duplex) {
+        ma_close_stream__aaudio(pDevice->pContext, (ma_AAudioStream*)pDevice->aaudio.pStreamCapture);
+        pDevice->aaudio.pStreamCapture = NULL;
+    }
+
+    if (deviceType == ma_device_type_playback || deviceType == ma_device_type_duplex) {
+        ma_close_stream__aaudio(pDevice->pContext, (ma_AAudioStream*)pDevice->aaudio.pStreamPlayback);
+        pDevice->aaudio.pStreamPlayback = NULL;
+    }
+
+    /* Now we need to reinitialize each streams. The hardest part with this is just filling output the config and descriptors. */
+    {
+        ma_device_config deviceConfig;
+        ma_device_descriptor descriptorPlayback;
+        ma_device_descriptor descriptorCapture;
+
+        deviceConfig = ma_device_config_init(deviceType);
+        deviceConfig.playback.pDeviceID             = NULL; /* Only doing rerouting with default devices. */
+        deviceConfig.playback.shareMode             = pDevice->playback.shareMode;
+        deviceConfig.playback.format                = pDevice->playback.format;
+        deviceConfig.playback.channels              = pDevice->playback.channels;
+        deviceConfig.capture.pDeviceID              = NULL; /* Only doing rerouting with default devices. */
+        deviceConfig.capture.shareMode              = pDevice->capture.shareMode;
+        deviceConfig.capture.format                 = pDevice->capture.format;
+        deviceConfig.capture.channels               = pDevice->capture.channels;
+        deviceConfig.sampleRate                     = pDevice->sampleRate;
+        deviceConfig.aaudio.usage                   = pDevice->aaudio.usage;
+        deviceConfig.aaudio.contentType             = pDevice->aaudio.contentType;
+        deviceConfig.aaudio.inputPreset             = pDevice->aaudio.inputPreset;
+        deviceConfig.aaudio.noAutoStartAfterReroute = pDevice->aaudio.noAutoStartAfterReroute;
+        deviceConfig.periods                        = 1;
+
+        /* Try to get an accurate period size. */
+        if (deviceType == ma_device_type_playback || deviceType == ma_device_type_duplex) {
+            deviceConfig.periodSizeInFrames = pDevice->playback.internalPeriodSizeInFrames;
+        } else {
+            deviceConfig.periodSizeInFrames = pDevice->capture.internalPeriodSizeInFrames;
+        }
+
+        if (deviceType == ma_device_type_capture || deviceType == ma_device_type_duplex || deviceType == ma_device_type_loopback) {
+            descriptorCapture.pDeviceID           = deviceConfig.capture.pDeviceID;
+            descriptorCapture.shareMode           = deviceConfig.capture.shareMode;
+            descriptorCapture.format              = deviceConfig.capture.format;
+            descriptorCapture.channels            = deviceConfig.capture.channels;
+            descriptorCapture.sampleRate          = deviceConfig.sampleRate;
+            descriptorCapture.periodSizeInFrames  = deviceConfig.periodSizeInFrames;
+            descriptorCapture.periodCount         = deviceConfig.periods;
+        }
+
+        if (deviceType == ma_device_type_playback || deviceType == ma_device_type_duplex) {
+            descriptorPlayback.pDeviceID          = deviceConfig.playback.pDeviceID;
+            descriptorPlayback.shareMode          = deviceConfig.playback.shareMode;
+            descriptorPlayback.format             = deviceConfig.playback.format;
+            descriptorPlayback.channels           = deviceConfig.playback.channels;
+            descriptorPlayback.sampleRate         = deviceConfig.sampleRate;
+            descriptorPlayback.periodSizeInFrames = deviceConfig.periodSizeInFrames;
+            descriptorPlayback.periodCount        = deviceConfig.periods;
+        }
+
+        result = ma_device_init__aaudio(pDevice, &deviceConfig, &descriptorPlayback, &descriptorCapture);
+        if (result != MA_SUCCESS) {
+            return result;
+        }
+
+        result = ma_device_post_init(pDevice, deviceType, &descriptorPlayback, &descriptorCapture);
+        if (result != MA_SUCCESS) {
+            ma_device_uninit__aaudio(pDevice);
+            return result;
+        }
+
+        /* We'll only ever do this in response to a reroute. */
+        ma_device__on_notification_rerouted(pDevice);
+
+        /* If the device is started, start the streams. Maybe make this configurable? */
+        if (ma_device_get_state(pDevice) == ma_device_state_started) {
+            if (pDevice->aaudio.noAutoStartAfterReroute == MA_FALSE) {
+                ma_device_start__aaudio(pDevice);
+            } else {
+                ma_device_stop(pDevice);    /* Do a full device stop so we set internal state correctly. */
+            }
+        }
+
+        return MA_SUCCESS;
+    }
+}
+
 static ma_result ma_device_get_info__aaudio(ma_device* pDevice, ma_device_type type, ma_device_info* pDeviceInfo)
 {
     ma_AAudioStream* pStream = NULL;
@@ -24915,6 +25594,8 @@ static ma_result ma_context_uninit__aaudio(ma_context* pContext)
 {
     MA_ASSERT(pContext != NULL);
     MA_ASSERT(pContext->backend == ma_backend_aaudio);
+
+    ma_device_job_thread_uninit(&pContext->aaudio.jobThread, &pContext->allocationCallbacks);
 
     ma_dlclose(pContext, pContext->aaudio.hAAudio);
     pContext->aaudio.hAAudio = NULL;
@@ -24983,8 +25664,44 @@ static ma_result ma_context_init__aaudio(ma_context* pContext, const ma_context_
     pCallbacks->onDeviceDataLoop          = NULL;   /* Not used because AAudio is asynchronous. */
     pCallbacks->onDeviceGetInfo           = ma_device_get_info__aaudio;
 
+
+    /* We need a job thread so we can deal with rerouting. */
+    {
+        ma_result result;
+        ma_device_job_thread_config jobThreadConfig;
+
+        jobThreadConfig = ma_device_job_thread_config_init();
+
+        result = ma_device_job_thread_init(&jobThreadConfig, &pContext->allocationCallbacks, &pContext->aaudio.jobThread);
+        if (result != MA_SUCCESS) {
+            ma_dlclose(pContext, pContext->aaudio.hAAudio);
+            pContext->aaudio.hAAudio = NULL;
+            return result;
+        }
+    }
+    
+
     (void)pConfig;
     return MA_SUCCESS;
+}
+
+static ma_result ma_job_process__device__aaudio_reroute(ma_job* pJob)
+{
+    ma_device* pDevice;
+
+    MA_ASSERT(pJob != NULL);
+
+    pDevice = (ma_device*)pJob->data.device.aaudio.reroute.pDevice;
+    MA_ASSERT(pDevice != NULL);
+
+    /* Here is where we need to reroute the device. To do this we need to uninitialize the stream and reinitialize it. */
+    return ma_device_reinit__aaudio(pDevice, (ma_device_type)pJob->data.device.aaudio.reroute.deviceType);
+}
+#else
+/* Getting here means there is no AAudio backend so we need a no-op job implementation. */
+static ma_result ma_job_process__device__aaudio_reroute(ma_job* pJob)
+{
+    return ma_job_process__noop(pJob);
 }
 #endif  /* AAudio */
 
@@ -26470,6 +27187,7 @@ static ma_result ma_device_init_by_type__webaudio(ma_device* pDevice, const ma_d
     sampleRate         = (pDescriptor->sampleRate > 0) ? pDescriptor->sampleRate : MA_DEFAULT_SAMPLE_RATE;
     periodSizeInFrames = ma_calculate_period_size_in_frames_from_descriptor__webaudio(pDescriptor, sampleRate, pConfig->performanceProfile);
 
+    ma_log_postf(ma_device_get_log(pDevice), MA_LOG_LEVEL_DEBUG, "periodSizeInFrames = %d\n", (int)periodSizeInFrames);
 
     /* We create the device on the JavaScript side and reference it using an index. We use this to make it possible to reference the device between JavaScript and C. */
     deviceIndex = EM_ASM_INT({
@@ -27053,6 +27771,90 @@ static ma_result ma_device__post_init_setup(ma_device* pDevice, ma_device_type d
     return MA_SUCCESS;
 }
 
+MA_API ma_result ma_device_post_init(ma_device* pDevice, ma_device_type deviceType, const ma_device_descriptor* pDescriptorPlayback, const ma_device_descriptor* pDescriptorCapture)
+{
+    ma_result result;
+
+    if (pDevice == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    /* Capture. */
+    if (deviceType == ma_device_type_capture || deviceType == ma_device_type_duplex || deviceType == ma_device_type_loopback) {
+        if (ma_device_descriptor_is_valid(pDescriptorCapture) == MA_FALSE) {
+            return MA_INVALID_ARGS;
+        }
+
+        pDevice->capture.internalFormat             = pDescriptorCapture->format;
+        pDevice->capture.internalChannels           = pDescriptorCapture->channels;
+        pDevice->capture.internalSampleRate         = pDescriptorCapture->sampleRate;
+        MA_COPY_MEMORY(pDevice->capture.internalChannelMap, pDescriptorCapture->channelMap, sizeof(pDescriptorCapture->channelMap));
+        pDevice->capture.internalPeriodSizeInFrames = pDescriptorCapture->periodSizeInFrames;
+        pDevice->capture.internalPeriods            = pDescriptorCapture->periodCount;
+
+        if (pDevice->capture.internalPeriodSizeInFrames == 0) {
+            pDevice->capture.internalPeriodSizeInFrames = ma_calculate_buffer_size_in_frames_from_milliseconds(pDescriptorCapture->periodSizeInMilliseconds, pDescriptorCapture->sampleRate);
+        }
+    }
+
+    /* Playback. */
+    if (deviceType == ma_device_type_playback || deviceType == ma_device_type_duplex) {
+        if (ma_device_descriptor_is_valid(pDescriptorPlayback) == MA_FALSE) {
+            return MA_INVALID_ARGS;
+        }
+
+        pDevice->playback.internalFormat             = pDescriptorPlayback->format;
+        pDevice->playback.internalChannels           = pDescriptorPlayback->channels;
+        pDevice->playback.internalSampleRate         = pDescriptorPlayback->sampleRate;
+        MA_COPY_MEMORY(pDevice->playback.internalChannelMap, pDescriptorPlayback->channelMap, sizeof(pDescriptorPlayback->channelMap));
+        pDevice->playback.internalPeriodSizeInFrames = pDescriptorPlayback->periodSizeInFrames;
+        pDevice->playback.internalPeriods            = pDescriptorPlayback->periodCount;
+
+        if (pDevice->playback.internalPeriodSizeInFrames == 0) {
+            pDevice->playback.internalPeriodSizeInFrames = ma_calculate_buffer_size_in_frames_from_milliseconds(pDescriptorPlayback->periodSizeInMilliseconds, pDescriptorPlayback->sampleRate);
+        }
+    }
+
+    /*
+    The name of the device can be retrieved from device info. This may be temporary and replaced with a `ma_device_get_info(pDevice, deviceType)` instead.
+    For loopback devices, we need to retrieve the name of the playback device.
+    */
+    {
+        ma_device_info deviceInfo;
+
+        if (deviceType == ma_device_type_capture || deviceType == ma_device_type_duplex || deviceType == ma_device_type_loopback) {
+            result = ma_device_get_info(pDevice, (deviceType == ma_device_type_loopback) ? ma_device_type_playback : ma_device_type_capture, &deviceInfo);
+            if (result == MA_SUCCESS) {
+                ma_strncpy_s(pDevice->capture.name, sizeof(pDevice->capture.name), deviceInfo.name, (size_t)-1);
+            } else {
+                /* We failed to retrieve the device info. Fall back to a default name. */
+                if (pDescriptorCapture->pDeviceID == NULL) {
+                    ma_strncpy_s(pDevice->capture.name, sizeof(pDevice->capture.name), MA_DEFAULT_CAPTURE_DEVICE_NAME, (size_t)-1);
+                } else {
+                    ma_strncpy_s(pDevice->capture.name, sizeof(pDevice->capture.name), "Capture Device", (size_t)-1);
+                }
+            }
+        }
+
+        if (deviceType == ma_device_type_playback || deviceType == ma_device_type_duplex) {
+            result = ma_device_get_info(pDevice, ma_device_type_playback, &deviceInfo);
+            if (result == MA_SUCCESS) {
+                ma_strncpy_s(pDevice->playback.name, sizeof(pDevice->playback.name), deviceInfo.name, (size_t)-1);
+            } else {
+                /* We failed to retrieve the device info. Fall back to a default name. */
+                if (pDescriptorPlayback->pDeviceID == NULL) {
+                    ma_strncpy_s(pDevice->playback.name, sizeof(pDevice->playback.name), MA_DEFAULT_PLAYBACK_DEVICE_NAME, (size_t)-1);
+                } else {
+                    ma_strncpy_s(pDevice->playback.name, sizeof(pDevice->playback.name), "Playback Device", (size_t)-1);
+                }
+            }
+        }
+    }
+
+    /* Update data conversion. */
+    return ma_device__post_init_setup(pDevice, deviceType); /* TODO: Should probably rename ma_device__post_init_setup() to something better. */
+}
+
 
 static ma_thread_result MA_THREADCALL ma_worker_thread(void* pData)
 {
@@ -27101,13 +27903,18 @@ static ma_thread_result MA_THREADCALL ma_worker_thread(void* pData)
             startResult = MA_SUCCESS;
         }
 
+        /*
+        If starting was not successful we'll need to loop back to the start and wait for something
+        to happen (pDevice->wakeupEvent).
+        */
         if (startResult != MA_SUCCESS) {
             pDevice->workResult = startResult;
-            continue;   /* Failed to start. Loop back to the start and wait for something to happen (pDevice->wakeupEvent). */
+            ma_event_signal(&pDevice->startEvent);  /* <-- Always signal the start event so ma_device_start() can return as it'll be waiting on it. */
+            continue;
         }
 
         /* Make sure the state is set appropriately. */
-        ma_device__set_state(pDevice, ma_device_state_started);
+        ma_device__set_state(pDevice, ma_device_state_started); /* <-- Set this before signaling the event so that the state is always guaranteed to be good after ma_device_start() has returned. */
         ma_event_signal(&pDevice->startEvent);
 
         ma_device__on_notification_started(pDevice);
@@ -27330,7 +28137,138 @@ static ma_bool32 ma_context_is_backend_asynchronous(ma_context* pContext)
 }
 
 
-MA_API ma_context_config ma_context_config_init()
+/* The default capacity doesn't need to be too big. */
+#ifndef MA_DEFAULT_DEVICE_JOB_QUEUE_CAPACITY
+#define MA_DEFAULT_DEVICE_JOB_QUEUE_CAPACITY    32
+#endif
+
+MA_API ma_device_job_thread_config ma_device_job_thread_config_init(void)
+{
+    ma_device_job_thread_config config;
+
+    MA_ZERO_OBJECT(&config);
+    config.noThread         = MA_FALSE;
+    config.jobQueueCapacity = MA_DEFAULT_DEVICE_JOB_QUEUE_CAPACITY;
+    config.jobQueueFlags    = 0;
+
+    return config;
+}
+
+
+static ma_thread_result MA_THREADCALL ma_device_job_thread_entry(void* pUserData)
+{
+    ma_device_job_thread* pJobThread = (ma_device_job_thread*)pUserData;
+    MA_ASSERT(pJobThread != NULL);
+
+    for (;;) {
+        ma_result result;
+        ma_job job;
+
+        result = ma_device_job_thread_next(pJobThread, &job);
+        if (result != MA_SUCCESS) {
+            break;
+        }
+
+        if (job.toc.breakup.code == MA_JOB_TYPE_QUIT) {
+            break;
+        }
+
+        ma_job_process(&job);
+    }
+
+    return (ma_thread_result)0;
+}
+
+MA_API ma_result ma_device_job_thread_init(const ma_device_job_thread_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_device_job_thread* pJobThread)
+{
+    ma_result result;
+    ma_job_queue_config jobQueueConfig;
+
+    if (pJobThread == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    MA_ZERO_OBJECT(pJobThread);
+
+    if (pConfig == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+
+    /* Initialize the job queue before the thread to ensure it's in a valid state. */
+    jobQueueConfig = ma_job_queue_config_init(pConfig->jobQueueFlags, pConfig->jobQueueCapacity);   
+
+    result = ma_job_queue_init(&jobQueueConfig, pAllocationCallbacks, &pJobThread->jobQueue);
+    if (result != MA_SUCCESS) {
+        return result;  /* Failed to initialize job queue. */
+    }
+
+
+    /* The thread needs to be initialized after the job queue to ensure the thread doesn't try to access it prematurely. */
+    if (pConfig->noThread == MA_FALSE) {
+        result = ma_thread_create(&pJobThread->thread, ma_thread_priority_normal, 0, ma_device_job_thread_entry, pJobThread, pAllocationCallbacks);
+        if (result != MA_SUCCESS) {
+            ma_job_queue_uninit(&pJobThread->jobQueue, pAllocationCallbacks);
+            return result;  /* Failed to create the job thread. */
+        }
+
+        pJobThread->_hasThread = MA_TRUE;
+    } else {
+        pJobThread->_hasThread = MA_FALSE;
+    }
+
+
+    return MA_SUCCESS;
+}
+
+MA_API void ma_device_job_thread_uninit(ma_device_job_thread* pJobThread, const ma_allocation_callbacks* pAllocationCallbacks)
+{
+    if (pJobThread == NULL) {
+        return;
+    }
+
+    /* The first thing to do is post a quit message to the job queue. If we're using a thread we'll need to wait for it. */
+    {
+        ma_job job = ma_job_init(MA_JOB_TYPE_QUIT);
+        ma_device_job_thread_post(pJobThread, &job);
+    }
+
+    /* Wait for the thread to terminate naturally. */
+    if (pJobThread->_hasThread) {
+        ma_thread_wait(&pJobThread->thread);
+    }
+
+    /* At this point the thread should be terminated so we can safely uninitialize the job queue. */
+    ma_job_queue_uninit(&pJobThread->jobQueue, pAllocationCallbacks);
+}
+
+MA_API ma_result ma_device_job_thread_post(ma_device_job_thread* pJobThread, const ma_job* pJob)
+{
+    if (pJobThread == NULL || pJob == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    return ma_job_queue_post(&pJobThread->jobQueue, pJob);
+}
+
+MA_API ma_result ma_device_job_thread_next(ma_device_job_thread* pJobThread, ma_job* pJob)
+{
+    if (pJob == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    MA_ZERO_OBJECT(pJob);
+
+    if (pJobThread == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    return ma_job_queue_next(&pJobThread->jobQueue, pJob);
+}
+
+
+
+MA_API ma_context_config ma_context_config_init(void)
 {
     ma_context_config config;
     MA_ZERO_OBJECT(&config);
@@ -27918,7 +28856,7 @@ MA_API ma_result ma_device_init(ma_context* pContext, const ma_device_config* pC
         return result;
     }
 
-
+#if 0
     /*
     On output the descriptors will contain the *actual* data format of the device. We need this to know how to convert the data between
     the requested format and the internal format.
@@ -27998,6 +28936,14 @@ MA_API ma_result ma_device_init(ma_context* pContext, const ma_device_config* pC
 
 
     ma_device__post_init_setup(pDevice, pConfig->deviceType);
+#endif
+
+    result = ma_device_post_init(pDevice, pConfig->deviceType, &descriptorPlayback, &descriptorCapture);
+    if (result != MA_SUCCESS) {
+        ma_device_uninit(pDevice);
+        return result;
+    }
+
 
 
     /*
@@ -28027,6 +28973,10 @@ MA_API ma_result ma_device_init(ma_context* pContext, const ma_device_config* pC
                 ma_device_uninit(pDevice);
                 return MA_OUT_OF_MEMORY;
             }
+
+            /* Silence the buffer for safety. */
+            ma_silence_pcm_frames(pDevice->capture.pIntermediaryBuffer, pDevice->capture.intermediaryBufferCap, pDevice->capture.format, pDevice->capture.channels);
+            pDevice->capture.intermediaryBufferLen = pDevice->capture.intermediaryBufferCap;
         }
 
         if (pConfig->deviceType == ma_device_type_playback || pConfig->deviceType == ma_device_type_duplex) {
@@ -28049,6 +28999,10 @@ MA_API ma_result ma_device_init(ma_context* pContext, const ma_device_config* pC
                 ma_device_uninit(pDevice);
                 return MA_OUT_OF_MEMORY;
             }
+
+            /* Silence the buffer for safety. */
+            ma_silence_pcm_frames(pDevice->playback.pIntermediaryBuffer, pDevice->playback.intermediaryBufferCap, pDevice->playback.format, pDevice->playback.channels);
+            pDevice->playback.intermediaryBufferLen = 0;
         }
     } else {
         /* Not using a fixed sized data callback so no need for an intermediary buffer. */
@@ -29082,272 +30036,6 @@ MA_API float ma_volume_linear_to_db(float factor)
 MA_API float ma_volume_db_to_linear(float gain)
 {
     return ma_powf(10, gain/20.0f);
-}
-
-
-
-MA_API ma_slot_allocator_config ma_slot_allocator_config_init(ma_uint32 capacity)
-{
-    ma_slot_allocator_config config;
-
-    MA_ZERO_OBJECT(&config);
-    config.capacity = capacity;
-
-    return config;
-}
-
-
-static MA_INLINE ma_uint32 ma_slot_allocator_calculate_group_capacity(ma_uint32 slotCapacity)
-{
-    ma_uint32 cap = slotCapacity / 32;
-    if ((slotCapacity % 32) != 0) {
-        cap += 1;
-    }
-
-    return cap;
-}
-
-static MA_INLINE ma_uint32 ma_slot_allocator_group_capacity(const ma_slot_allocator* pAllocator)
-{
-    return ma_slot_allocator_calculate_group_capacity(pAllocator->capacity);
-}
-
-
-typedef struct
-{
-    size_t sizeInBytes;
-    size_t groupsOffset;
-    size_t slotsOffset;
-} ma_slot_allocator_heap_layout;
-
-static ma_result ma_slot_allocator_get_heap_layout(const ma_slot_allocator_config* pConfig, ma_slot_allocator_heap_layout* pHeapLayout)
-{
-    MA_ASSERT(pHeapLayout != NULL);
-
-    MA_ZERO_OBJECT(pHeapLayout);
-
-    if (pConfig == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    if (pConfig->capacity == 0) {
-        return MA_INVALID_ARGS;
-    }
-
-    pHeapLayout->sizeInBytes = 0;
-
-    /* Groups. */
-    pHeapLayout->groupsOffset = pHeapLayout->sizeInBytes;
-    pHeapLayout->sizeInBytes += ma_align_64(ma_slot_allocator_calculate_group_capacity(pConfig->capacity) * sizeof(ma_slot_allocator_group));
-
-    /* Slots. */
-    pHeapLayout->slotsOffset  = pHeapLayout->sizeInBytes;
-    pHeapLayout->sizeInBytes += ma_align_64(pConfig->capacity * sizeof(ma_uint32));
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_slot_allocator_get_heap_size(const ma_slot_allocator_config* pConfig, size_t* pHeapSizeInBytes)
-{
-    ma_result result;
-    ma_slot_allocator_heap_layout layout;
-
-    if (pHeapSizeInBytes == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    *pHeapSizeInBytes = 0;
-
-    result = ma_slot_allocator_get_heap_layout(pConfig, &layout);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    *pHeapSizeInBytes = layout.sizeInBytes;
-
-    return result;
-}
-
-MA_API ma_result ma_slot_allocator_init_preallocated(const ma_slot_allocator_config* pConfig, void* pHeap, ma_slot_allocator* pAllocator)
-{
-    ma_result result;
-    ma_slot_allocator_heap_layout heapLayout;
-
-    if (pAllocator == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    MA_ZERO_OBJECT(pAllocator);
-
-    if (pHeap == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    result = ma_slot_allocator_get_heap_layout(pConfig, &heapLayout);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    pAllocator->_pHeap = pHeap;
-    MA_ZERO_MEMORY(pHeap, heapLayout.sizeInBytes);
-
-    pAllocator->pGroups  = (ma_slot_allocator_group*)ma_offset_ptr(pHeap, heapLayout.groupsOffset);
-    pAllocator->pSlots   = (ma_uint32*)ma_offset_ptr(pHeap, heapLayout.slotsOffset);
-    pAllocator->capacity = pConfig->capacity;
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_slot_allocator_init(const ma_slot_allocator_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_slot_allocator* pAllocator)
-{
-    ma_result result;
-    size_t heapSizeInBytes;
-    void* pHeap;
-
-    result = ma_slot_allocator_get_heap_size(pConfig, &heapSizeInBytes);
-    if (result != MA_SUCCESS) {
-        return result;  /* Failed to retrieve the size of the heap allocation. */
-    }
-
-    if (heapSizeInBytes > 0) {
-        pHeap = ma_malloc(heapSizeInBytes, pAllocationCallbacks);
-        if (pHeap == NULL) {
-            return MA_OUT_OF_MEMORY;
-        }
-    } else {
-        pHeap = NULL;
-    }
-
-    result = ma_slot_allocator_init_preallocated(pConfig, pHeap, pAllocator);
-    if (result != MA_SUCCESS) {
-        ma_free(pHeap, pAllocationCallbacks);
-        return result;
-    }
-
-    pAllocator->_ownsHeap = MA_TRUE;
-    return MA_SUCCESS;
-}
-
-MA_API void ma_slot_allocator_uninit(ma_slot_allocator* pAllocator, const ma_allocation_callbacks* pAllocationCallbacks)
-{
-    if (pAllocator == NULL) {
-        return;
-    }
-
-    if (pAllocator->_ownsHeap) {
-        ma_free(pAllocator->_pHeap, pAllocationCallbacks);
-    }
-}
-
-MA_API ma_result ma_slot_allocator_alloc(ma_slot_allocator* pAllocator, ma_uint64* pSlot)
-{
-    ma_uint32 iAttempt;
-    const ma_uint32 maxAttempts = 2;    /* The number of iterations to perform until returning MA_OUT_OF_MEMORY if no slots can be found. */
-
-    if (pAllocator == NULL || pSlot == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    for (iAttempt = 0; iAttempt < maxAttempts; iAttempt += 1) {
-        /* We need to acquire a suitable bitfield first. This is a bitfield that's got an available slot within it. */
-        ma_uint32 iGroup;
-        for (iGroup = 0; iGroup < ma_slot_allocator_group_capacity(pAllocator); iGroup += 1) {
-            /* CAS */
-            for (;;) {
-                ma_uint32 oldBitfield;
-                ma_uint32 newBitfield;
-                ma_uint32 bitOffset;
-
-                oldBitfield = c89atomic_load_32(&pAllocator->pGroups[iGroup].bitfield);  /* <-- This copy must happen. The compiler must not optimize this away. */
-
-                /* Fast check to see if anything is available. */
-                if (oldBitfield == 0xFFFFFFFF) {
-                    break;  /* No available bits in this bitfield. */
-                }
-
-                bitOffset = ma_ffs_32(~oldBitfield);
-                MA_ASSERT(bitOffset < 32);
-
-                newBitfield = oldBitfield | (1 << bitOffset);
-
-                if (c89atomic_compare_and_swap_32(&pAllocator->pGroups[iGroup].bitfield, oldBitfield, newBitfield) == oldBitfield) {
-                    ma_uint32 slotIndex;
-
-                    /* Increment the counter as soon as possible to have other threads report out-of-memory sooner than later. */
-                    c89atomic_fetch_add_32(&pAllocator->count, 1);
-
-                    /* The slot index is required for constructing the output value. */
-                    slotIndex = (iGroup << 5) + bitOffset;  /* iGroup << 5 = iGroup * 32 */
-                    if (slotIndex >= pAllocator->capacity) {
-                        return MA_OUT_OF_MEMORY;
-                    }
-
-                    /* Increment the reference count before constructing the output value. */
-                    pAllocator->pSlots[slotIndex] += 1;
-
-                    /* Construct the output value. */
-                    *pSlot = (((ma_uint64)pAllocator->pSlots[slotIndex] << 32) | slotIndex);
-
-                    return MA_SUCCESS;
-                }
-            }
-        }
-
-        /* We weren't able to find a slot. If it's because we've reached our capacity we need to return MA_OUT_OF_MEMORY. Otherwise we need to do another iteration and try again. */
-        if (pAllocator->count < pAllocator->capacity) {
-            ma_yield();
-        } else {
-            return MA_OUT_OF_MEMORY;
-        }
-    }
-
-    /* We couldn't find a slot within the maximum number of attempts. */
-    return MA_OUT_OF_MEMORY;
-}
-
-MA_API ma_result ma_slot_allocator_free(ma_slot_allocator* pAllocator, ma_uint64 slot)
-{
-    ma_uint32 iGroup;
-    ma_uint32 iBit;
-
-    if (pAllocator == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    iGroup = (ma_uint32)((slot & 0xFFFFFFFF) >> 5);   /* slot / 32 */
-    iBit   = (ma_uint32)((slot & 0xFFFFFFFF) & 31);   /* slot % 32 */
-
-    if (iGroup >= ma_slot_allocator_group_capacity(pAllocator)) {
-        return MA_INVALID_ARGS;
-    }
-
-    MA_ASSERT(iBit < 32);   /* This must be true due to the logic we used to actually calculate it. */
-
-    while (c89atomic_load_32(&pAllocator->count) > 0) {
-        /* CAS */
-        ma_uint32 oldBitfield;
-        ma_uint32 newBitfield;
-
-        oldBitfield = c89atomic_load_32(&pAllocator->pGroups[iGroup].bitfield);  /* <-- This copy must happen. The compiler must not optimize this away. */
-        newBitfield = oldBitfield & ~(1 << iBit);
-
-        /* Debugging for checking for double-frees. */
-        #if defined(MA_DEBUG_OUTPUT)
-        {
-            if ((oldBitfield & (1 << iBit)) == 0) {
-                MA_ASSERT(MA_FALSE);    /* Double free detected.*/
-            }
-        }
-        #endif
-
-        if (c89atomic_compare_and_swap_32(&pAllocator->pGroups[iGroup].bitfield, oldBitfield, newBitfield) == oldBitfield) {
-            c89atomic_fetch_sub_32(&pAllocator->count, 1);
-            return MA_SUCCESS;
-        }
-    }
-
-    /* Getting here means there are no allocations available for freeing. */
-    return MA_INVALID_OPERATION;
 }
 
 
@@ -33363,7 +34051,7 @@ static ma_result ma_hpf_get_heap_layout(const ma_hpf_config* pConfig, ma_hpf_hea
 
     pHeapLayout->sizeInBytes = 0;
 
-    /* LPF 1 */
+    /* HPF 1 */
     pHeapLayout->hpf1Offset = pHeapLayout->sizeInBytes;
     for (ihpf1 = 0; ihpf1 < hpf1Count; ihpf1 += 1) {
         size_t hpf1HeapSizeInBytes;
@@ -33377,7 +34065,7 @@ static ma_result ma_hpf_get_heap_layout(const ma_hpf_config* pConfig, ma_hpf_hea
         pHeapLayout->sizeInBytes += sizeof(ma_hpf1) + hpf1HeapSizeInBytes;
     }
 
-    /* LPF 2*/
+    /* HPF 2*/
     pHeapLayout->hpf2Offset = pHeapLayout->sizeInBytes;
     for (ihpf2 = 0; ihpf2 < hpf2Count; ihpf2 += 1) {
         size_t hpf2HeapSizeInBytes;
@@ -33461,7 +34149,7 @@ static ma_result ma_hpf_reinit__internal(const ma_hpf_config* pConfig, void* pHe
 
             result = ma_hpf1_get_heap_size(&hpf1Config, &hpf1HeapSizeInBytes);
             if (result == MA_SUCCESS) {
-                result = ma_hpf1_init_preallocated(&hpf1Config, ma_offset_ptr(pHeap, heapLayout.hpf1Offset + (ihpf1 * (sizeof(ma_hpf1) + hpf1HeapSizeInBytes)) + sizeof(ma_hpf1)), &pHPF->pHPF1[ihpf1]);
+                result = ma_hpf1_init_preallocated(&hpf1Config, ma_offset_ptr(pHeap, heapLayout.hpf1Offset + (sizeof(ma_hpf1) * hpf1Count) + (ihpf1 * hpf1HeapSizeInBytes)), &pHPF->pHPF1[ihpf1]);
             }
         } else {
             result = ma_hpf1_reinit(&hpf1Config, &pHPF->pHPF1[ihpf1]);
@@ -33498,7 +34186,7 @@ static ma_result ma_hpf_reinit__internal(const ma_hpf_config* pConfig, void* pHe
 
             result = ma_hpf2_get_heap_size(&hpf2Config, &hpf2HeapSizeInBytes);
             if (result == MA_SUCCESS) {
-                result = ma_hpf2_init_preallocated(&hpf2Config, ma_offset_ptr(pHeap, heapLayout.hpf2Offset + (ihpf2 * (sizeof(ma_hpf2) + hpf2HeapSizeInBytes)) + sizeof(ma_hpf2)), &pHPF->pHPF2[ihpf2]);
+                result = ma_hpf2_init_preallocated(&hpf2Config, ma_offset_ptr(pHeap, heapLayout.hpf2Offset + (sizeof(ma_hpf2) * hpf2Count) + (ihpf2 * hpf2HeapSizeInBytes)), &pHPF->pHPF2[ihpf2]);
             }
         } else {
             result = ma_hpf2_reinit(&hpf2Config, &pHPF->pHPF2[ihpf2]);
@@ -34013,7 +34701,7 @@ static ma_result ma_bpf_reinit__internal(const ma_bpf_config* pConfig, void* pHe
 
             result = ma_bpf2_get_heap_size(&bpf2Config, &bpf2HeapSizeInBytes);
             if (result == MA_SUCCESS) {
-                result = ma_bpf2_init_preallocated(&bpf2Config, ma_offset_ptr(pHeap, heapLayout.bpf2Offset + (ibpf2 * (sizeof(ma_bpf2) + bpf2HeapSizeInBytes)) + sizeof(ma_bpf2)), &pBPF->pBPF2[ibpf2]);
+                result = ma_bpf2_init_preallocated(&bpf2Config, ma_offset_ptr(pHeap, heapLayout.bpf2Offset + (sizeof(ma_bpf2) * bpf2Count) + (ibpf2 * bpf2HeapSizeInBytes)), &pBPF->pBPF2[ibpf2]);
             }
         } else {
             result = ma_bpf2_reinit(&bpf2Config, &pBPF->pBPF2[ibpf2]);
@@ -36362,21 +37050,36 @@ MA_API ma_result ma_spatializer_init_preallocated(const ma_spatializer_config* p
     pSpatializer->_pHeap = pHeap;
     MA_ZERO_MEMORY(pHeap, heapLayout.sizeInBytes);
 
-    pSpatializer->config       = *pConfig;
-    pSpatializer->position     = ma_vec3f_init_3f(0, 0,  0);
-    pSpatializer->direction    = ma_vec3f_init_3f(0, 0, -1);
-    pSpatializer->velocity     = ma_vec3f_init_3f(0, 0,  0);
-    pSpatializer->dopplerPitch = 1;
+    pSpatializer->channelsIn                   = pConfig->channelsIn;
+    pSpatializer->channelsOut                  = pConfig->channelsOut;
+    pSpatializer->attenuationModel             = pConfig->attenuationModel;
+    pSpatializer->positioning                  = pConfig->positioning;
+    pSpatializer->handedness                   = pConfig->handedness;
+    pSpatializer->minGain                      = pConfig->minGain;
+    pSpatializer->maxGain                      = pConfig->maxGain;
+    pSpatializer->minDistance                  = pConfig->minDistance;
+    pSpatializer->maxDistance                  = pConfig->maxDistance;
+    pSpatializer->rolloff                      = pConfig->rolloff;
+    pSpatializer->coneInnerAngleInRadians      = pConfig->coneInnerAngleInRadians;
+    pSpatializer->coneOuterAngleInRadians      = pConfig->coneOuterAngleInRadians;
+    pSpatializer->coneOuterGain                = pConfig->coneOuterGain;
+    pSpatializer->dopplerFactor                = pConfig->dopplerFactor;
+    pSpatializer->directionalAttenuationFactor = pConfig->directionalAttenuationFactor;
+    pSpatializer->gainSmoothTimeInFrames       = pConfig->gainSmoothTimeInFrames;
+    pSpatializer->position                     = ma_vec3f_init_3f(0, 0,  0);
+    pSpatializer->direction                    = ma_vec3f_init_3f(0, 0, -1);
+    pSpatializer->velocity                     = ma_vec3f_init_3f(0, 0,  0);
+    pSpatializer->dopplerPitch                 = 1;
 
     /* Swap the forward direction if we're left handed (it was initialized based on right handed). */
-    if (pSpatializer->config.handedness == ma_handedness_left) {
+    if (pSpatializer->handedness == ma_handedness_left) {
         pSpatializer->direction = ma_vec3f_neg(pSpatializer->direction);
     }
 
     /* Channel map. This will be on the heap. */
     if (pConfig->pChannelMapIn != NULL) {
-        pSpatializer->config.pChannelMapIn = (ma_channel*)ma_offset_ptr(pHeap, heapLayout.channelMapInOffset);
-        ma_channel_map_copy_or_default(pSpatializer->config.pChannelMapIn, pSpatializer->config.channelsIn, pConfig->pChannelMapIn, pSpatializer->config.channelsIn);
+        pSpatializer->pChannelMapIn = (ma_channel*)ma_offset_ptr(pHeap, heapLayout.channelMapInOffset);
+        ma_channel_map_copy_or_default(pSpatializer->pChannelMapIn, pSpatializer->channelsIn, pConfig->pChannelMapIn, pSpatializer->channelsIn);
     }
 
     /* New channel gains for output channels. */
@@ -36483,7 +37186,7 @@ static float ma_calculate_angular_gain(ma_vec3f dirA, ma_vec3f dirB, float coneI
 
 MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer, ma_spatializer_listener* pListener, void* pFramesOut, const void* pFramesIn, ma_uint64 frameCount)
 {
-    ma_channel* pChannelMapIn  = pSpatializer->config.pChannelMapIn;
+    ma_channel* pChannelMapIn  = pSpatializer->pChannelMapIn;
     ma_channel* pChannelMapOut = pListener->config.pChannelMapOut;
 
     if (pSpatializer == NULL) {
@@ -36491,17 +37194,17 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
     }
 
     /* If we're not spatializing we need to run an optimized path. */
-    if (pSpatializer->config.attenuationModel == ma_attenuation_model_none) {
+    if (c89atomic_load_i32(&pSpatializer->attenuationModel) == ma_attenuation_model_none) {
         if (ma_spatializer_listener_is_enabled(pListener)) {
             /* No attenuation is required, but we'll need to do some channel conversion. */
-            if (pSpatializer->config.channelsIn == pSpatializer->config.channelsOut) {
-                ma_copy_pcm_frames(pFramesOut, pFramesIn, frameCount, ma_format_f32, pSpatializer->config.channelsIn);
+            if (pSpatializer->channelsIn == pSpatializer->channelsOut) {
+                ma_copy_pcm_frames(pFramesOut, pFramesIn, frameCount, ma_format_f32, pSpatializer->channelsIn);
             } else {
-                ma_channel_map_apply_f32((float*)pFramesOut, pChannelMapOut, pSpatializer->config.channelsOut, (const float*)pFramesIn, pChannelMapIn, pSpatializer->config.channelsIn, frameCount, ma_channel_mix_mode_rectangular, ma_mono_expansion_mode_default);   /* Safe casts to float* because f32 is the only supported format. */
+                ma_channel_map_apply_f32((float*)pFramesOut, pChannelMapOut, pSpatializer->channelsOut, (const float*)pFramesIn, pChannelMapIn, pSpatializer->channelsIn, frameCount, ma_channel_mix_mode_rectangular, ma_mono_expansion_mode_default);   /* Safe casts to float* because f32 is the only supported format. */
             }
         } else {
             /* The listener is disabled. Output silence. */
-            ma_silence_pcm_frames(pFramesOut, frameCount, ma_format_f32, pSpatializer->config.channelsOut);
+            ma_silence_pcm_frames(pFramesOut, frameCount, ma_format_f32, pSpatializer->channelsOut);
         }
 
         /*
@@ -36523,8 +37226,12 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
         float distance = 0;
         float gain = 1;
         ma_uint32 iChannel;
-        const ma_uint32 channelsOut = pSpatializer->config.channelsOut;
-        const ma_uint32 channelsIn  = pSpatializer->config.channelsIn;
+        const ma_uint32 channelsOut = pSpatializer->channelsOut;
+        const ma_uint32 channelsIn  = pSpatializer->channelsIn;
+        float minDistance = ma_spatializer_get_min_distance(pSpatializer);
+        float maxDistance = ma_spatializer_get_max_distance(pSpatializer);
+        float rolloff = ma_spatializer_get_rolloff(pSpatializer);
+        float dopplerFactor = ma_spatializer_get_doppler_factor(pSpatializer);
 
         /*
         We'll need the listener velocity for doppler pitch calculations. The speed of sound is
@@ -36538,7 +37245,7 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
             speedOfSound = MA_DEFAULT_SPEED_OF_SOUND;
         }
 
-        if (pListener == NULL || pSpatializer->config.positioning == ma_positioning_relative) {
+        if (pListener == NULL || ma_spatializer_get_positioning(pSpatializer) == ma_positioning_relative) {
             /* There's no listener or we're using relative positioning. */
             relativePos = pSpatializer->position;
             relativeDir = pSpatializer->direction;
@@ -36554,18 +37261,18 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
         distance = ma_vec3f_len(relativePos);
 
         /* We've gathered the data, so now we can apply some spatialization. */
-        switch (pSpatializer->config.attenuationModel) {
+        switch (ma_spatializer_get_attenuation_model(pSpatializer)) {
             case ma_attenuation_model_inverse:
             {
-                gain = ma_attenuation_inverse(distance, pSpatializer->config.minDistance, pSpatializer->config.maxDistance, pSpatializer->config.rolloff);
+                gain = ma_attenuation_inverse(distance, minDistance, maxDistance, rolloff);
             } break;
             case ma_attenuation_model_linear:
             {
-                gain = ma_attenuation_linear(distance, pSpatializer->config.minDistance, pSpatializer->config.maxDistance, pSpatializer->config.rolloff);
+                gain = ma_attenuation_linear(distance, minDistance, maxDistance, rolloff);
             } break;
             case ma_attenuation_model_exponential:
             {
-                gain = ma_attenuation_exponential(distance, pSpatializer->config.minDistance, pSpatializer->config.maxDistance, pSpatializer->config.rolloff);
+                gain = ma_attenuation_exponential(distance, minDistance, maxDistance, rolloff);
             } break;
             case ma_attenuation_model_none:
             default:
@@ -36600,7 +37307,12 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
         */
         if (distance > 0) {
             /* Source anglular gain. */
-            gain *= ma_calculate_angular_gain(relativeDir, ma_vec3f_neg(relativePosNormalized), pSpatializer->config.coneInnerAngleInRadians, pSpatializer->config.coneOuterAngleInRadians, pSpatializer->config.coneOuterGain);
+            float spatializerConeInnerAngle;
+            float spatializerConeOuterAngle;
+            float spatializerConeOuterGain;
+            ma_spatializer_get_cone(pSpatializer, &spatializerConeInnerAngle, &spatializerConeOuterAngle, &spatializerConeOuterGain);
+
+            gain *= ma_calculate_angular_gain(relativeDir, ma_vec3f_neg(relativePosNormalized), spatializerConeInnerAngle, spatializerConeOuterAngle, spatializerConeOuterGain);
 
             /*
             We're supporting angular gain on the listener as well for those who want to reduce the volume of sounds that
@@ -36630,7 +37342,7 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
 
 
         /* Clamp the gain. */
-        gain = ma_clamp(gain, pSpatializer->config.minGain, pSpatializer->config.maxGain);
+        gain = ma_clamp(gain, ma_spatializer_get_min_gain(pSpatializer), ma_spatializer_get_max_gain(pSpatializer));
 
         /*
         Panning. This is where we'll apply the gain and convert to the output channel count. We have an optimized path for
@@ -36664,7 +37376,7 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
         if (ma_spatializer_listener_is_enabled(pListener)) {
             ma_channel_map_apply_f32((float*)pFramesOut, pChannelMapOut, channelsOut, (const float*)pFramesIn, pChannelMapIn, channelsIn, frameCount, ma_channel_mix_mode_rectangular, ma_mono_expansion_mode_default);
         } else {
-            ma_silence_pcm_frames(pFramesOut, frameCount, ma_format_f32, pSpatializer->config.channelsOut);
+            ma_silence_pcm_frames(pFramesOut, frameCount, ma_format_f32, pSpatializer->channelsOut);
         }
 
         /*
@@ -36685,7 +37397,7 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
 
                 channelOut = ma_channel_map_get_channel(pChannelMapOut, channelsOut, iChannel);
                 if (ma_is_spatial_channel_position(channelOut)) {
-                    d = ma_mix_f32_fast(1, ma_vec3f_dot(unitPos, ma_get_channel_direction(channelOut)), pSpatializer->config.directionalAttenuationFactor);
+                    d = ma_mix_f32_fast(1, ma_vec3f_dot(unitPos, ma_get_channel_direction(channelOut)), ma_spatializer_get_directional_attenuation_factor(pSpatializer));
                 } else {
                     d = 1;  /* It's not a spatial channel so there's no real notion of direction. */
                 }
@@ -36764,8 +37476,8 @@ MA_API ma_result ma_spatializer_process_pcm_frames(ma_spatializer* pSpatializer,
         because the doppler calculation needs to be source-to-listener, but ours is listener-to-
         source.
         */
-        if (pSpatializer->config.dopplerFactor > 0) {
-            pSpatializer->dopplerPitch = ma_doppler_pitch(ma_vec3f_sub(pListener->position, pSpatializer->position), pSpatializer->velocity, listenerVel, speedOfSound, pSpatializer->config.dopplerFactor);
+        if (dopplerFactor > 0) {
+            pSpatializer->dopplerPitch = ma_doppler_pitch(ma_vec3f_sub(pListener->position, pSpatializer->position), pSpatializer->velocity, listenerVel, speedOfSound, dopplerFactor);
         } else {
             pSpatializer->dopplerPitch = 1;
         }
@@ -36780,7 +37492,7 @@ MA_API ma_uint32 ma_spatializer_get_input_channels(const ma_spatializer* pSpatia
         return 0;
     }
 
-    return pSpatializer->config.channelsIn;
+    return pSpatializer->channelsIn;
 }
 
 MA_API ma_uint32 ma_spatializer_get_output_channels(const ma_spatializer* pSpatializer)
@@ -36789,7 +37501,7 @@ MA_API ma_uint32 ma_spatializer_get_output_channels(const ma_spatializer* pSpati
         return 0;
     }
 
-    return pSpatializer->config.channelsOut;
+    return pSpatializer->channelsOut;
 }
 
 MA_API void ma_spatializer_set_attenuation_model(ma_spatializer* pSpatializer, ma_attenuation_model attenuationModel)
@@ -36798,7 +37510,7 @@ MA_API void ma_spatializer_set_attenuation_model(ma_spatializer* pSpatializer, m
         return;
     }
 
-    pSpatializer->config.attenuationModel = attenuationModel;
+    c89atomic_exchange_i32(&pSpatializer->attenuationModel, attenuationModel);
 }
 
 MA_API ma_attenuation_model ma_spatializer_get_attenuation_model(const ma_spatializer* pSpatializer)
@@ -36807,7 +37519,7 @@ MA_API ma_attenuation_model ma_spatializer_get_attenuation_model(const ma_spatia
         return ma_attenuation_model_none;
     }
 
-    return pSpatializer->config.attenuationModel;
+    return (ma_attenuation_model)c89atomic_load_i32(&pSpatializer->attenuationModel);
 }
 
 MA_API void ma_spatializer_set_positioning(ma_spatializer* pSpatializer, ma_positioning positioning)
@@ -36816,7 +37528,7 @@ MA_API void ma_spatializer_set_positioning(ma_spatializer* pSpatializer, ma_posi
         return;
     }
 
-    pSpatializer->config.positioning = positioning;
+    c89atomic_exchange_i32(&pSpatializer->positioning, positioning);
 }
 
 MA_API ma_positioning ma_spatializer_get_positioning(const ma_spatializer* pSpatializer)
@@ -36825,7 +37537,7 @@ MA_API ma_positioning ma_spatializer_get_positioning(const ma_spatializer* pSpat
         return ma_positioning_absolute;
     }
 
-    return pSpatializer->config.positioning;
+    return (ma_positioning)c89atomic_load_i32(&pSpatializer->positioning);
 }
 
 MA_API void ma_spatializer_set_rolloff(ma_spatializer* pSpatializer, float rolloff)
@@ -36834,7 +37546,7 @@ MA_API void ma_spatializer_set_rolloff(ma_spatializer* pSpatializer, float rollo
         return;
     }
 
-    pSpatializer->config.rolloff = rolloff;
+    c89atomic_exchange_f32(&pSpatializer->rolloff, rolloff);
 }
 
 MA_API float ma_spatializer_get_rolloff(const ma_spatializer* pSpatializer)
@@ -36843,7 +37555,7 @@ MA_API float ma_spatializer_get_rolloff(const ma_spatializer* pSpatializer)
         return 0;
     }
 
-    return pSpatializer->config.rolloff;
+    return c89atomic_load_f32(&pSpatializer->rolloff);
 }
 
 MA_API void ma_spatializer_set_min_gain(ma_spatializer* pSpatializer, float minGain)
@@ -36852,7 +37564,7 @@ MA_API void ma_spatializer_set_min_gain(ma_spatializer* pSpatializer, float minG
         return;
     }
 
-    pSpatializer->config.minGain = minGain;
+    c89atomic_exchange_f32(&pSpatializer->minGain, minGain);
 }
 
 MA_API float ma_spatializer_get_min_gain(const ma_spatializer* pSpatializer)
@@ -36861,7 +37573,7 @@ MA_API float ma_spatializer_get_min_gain(const ma_spatializer* pSpatializer)
         return 0;
     }
 
-    return pSpatializer->config.minGain;
+    return c89atomic_load_f32(&pSpatializer->minGain);
 }
 
 MA_API void ma_spatializer_set_max_gain(ma_spatializer* pSpatializer, float maxGain)
@@ -36870,7 +37582,7 @@ MA_API void ma_spatializer_set_max_gain(ma_spatializer* pSpatializer, float maxG
         return;
     }
 
-    pSpatializer->config.maxGain = maxGain;
+    c89atomic_exchange_f32(&pSpatializer->maxGain, maxGain);
 }
 
 MA_API float ma_spatializer_get_max_gain(const ma_spatializer* pSpatializer)
@@ -36879,7 +37591,7 @@ MA_API float ma_spatializer_get_max_gain(const ma_spatializer* pSpatializer)
         return 0;
     }
 
-    return pSpatializer->config.maxGain;
+    return c89atomic_load_f32(&pSpatializer->maxGain);
 }
 
 MA_API void ma_spatializer_set_min_distance(ma_spatializer* pSpatializer, float minDistance)
@@ -36888,7 +37600,7 @@ MA_API void ma_spatializer_set_min_distance(ma_spatializer* pSpatializer, float 
         return;
     }
 
-    pSpatializer->config.minDistance = minDistance;
+    c89atomic_exchange_f32(&pSpatializer->minDistance, minDistance);
 }
 
 MA_API float ma_spatializer_get_min_distance(const ma_spatializer* pSpatializer)
@@ -36897,7 +37609,7 @@ MA_API float ma_spatializer_get_min_distance(const ma_spatializer* pSpatializer)
         return 0;
     }
 
-    return pSpatializer->config.minDistance;
+    return c89atomic_load_f32(&pSpatializer->minDistance);
 }
 
 MA_API void ma_spatializer_set_max_distance(ma_spatializer* pSpatializer, float maxDistance)
@@ -36906,7 +37618,7 @@ MA_API void ma_spatializer_set_max_distance(ma_spatializer* pSpatializer, float 
         return;
     }
 
-    pSpatializer->config.maxDistance = maxDistance;
+    c89atomic_exchange_f32(&pSpatializer->maxDistance, maxDistance);
 }
 
 MA_API float ma_spatializer_get_max_distance(const ma_spatializer* pSpatializer)
@@ -36915,7 +37627,7 @@ MA_API float ma_spatializer_get_max_distance(const ma_spatializer* pSpatializer)
         return 0;
     }
 
-    return pSpatializer->config.maxDistance;
+    return c89atomic_load_f32(&pSpatializer->maxDistance);
 }
 
 MA_API void ma_spatializer_set_cone(ma_spatializer* pSpatializer, float innerAngleInRadians, float outerAngleInRadians, float outerGain)
@@ -36924,9 +37636,9 @@ MA_API void ma_spatializer_set_cone(ma_spatializer* pSpatializer, float innerAng
         return;
     }
 
-    pSpatializer->config.coneInnerAngleInRadians = innerAngleInRadians;
-    pSpatializer->config.coneOuterAngleInRadians = outerAngleInRadians;
-    pSpatializer->config.coneOuterGain           = outerGain;
+    c89atomic_exchange_f32(&pSpatializer->coneInnerAngleInRadians, innerAngleInRadians);
+    c89atomic_exchange_f32(&pSpatializer->coneOuterAngleInRadians, outerAngleInRadians);
+    c89atomic_exchange_f32(&pSpatializer->coneOuterGain,           outerGain);
 }
 
 MA_API void ma_spatializer_get_cone(const ma_spatializer* pSpatializer, float* pInnerAngleInRadians, float* pOuterAngleInRadians, float* pOuterGain)
@@ -36936,15 +37648,15 @@ MA_API void ma_spatializer_get_cone(const ma_spatializer* pSpatializer, float* p
     }
 
     if (pInnerAngleInRadians != NULL) {
-        *pInnerAngleInRadians = pSpatializer->config.coneInnerAngleInRadians;
+        *pInnerAngleInRadians = c89atomic_load_f32(&pSpatializer->coneInnerAngleInRadians);
     }
 
     if (pOuterAngleInRadians != NULL) {
-        *pOuterAngleInRadians = pSpatializer->config.coneOuterAngleInRadians;
+        *pOuterAngleInRadians = c89atomic_load_f32(&pSpatializer->coneOuterAngleInRadians);
     }
 
     if (pOuterGain != NULL) {
-        *pOuterGain = pSpatializer->config.coneOuterGain;
+        *pOuterGain = c89atomic_load_f32(&pSpatializer->coneOuterGain);
     }
 }
 
@@ -36954,7 +37666,7 @@ MA_API void ma_spatializer_set_doppler_factor(ma_spatializer* pSpatializer, floa
         return;
     }
 
-    pSpatializer->config.dopplerFactor = dopplerFactor;
+    c89atomic_exchange_f32(&pSpatializer->dopplerFactor, dopplerFactor);
 }
 
 MA_API float ma_spatializer_get_doppler_factor(const ma_spatializer* pSpatializer)
@@ -36963,7 +37675,7 @@ MA_API float ma_spatializer_get_doppler_factor(const ma_spatializer* pSpatialize
         return 1;
     }
 
-    return pSpatializer->config.dopplerFactor;
+    return c89atomic_load_f32(&pSpatializer->dopplerFactor);
 }
 
 MA_API void ma_spatializer_set_directional_attenuation_factor(ma_spatializer* pSpatializer, float directionalAttenuationFactor)
@@ -36972,7 +37684,7 @@ MA_API void ma_spatializer_set_directional_attenuation_factor(ma_spatializer* pS
         return;
     }
 
-    pSpatializer->config.directionalAttenuationFactor = directionalAttenuationFactor;
+    c89atomic_exchange_f32(&pSpatializer->directionalAttenuationFactor, directionalAttenuationFactor);
 }
 
 MA_API float ma_spatializer_get_directional_attenuation_factor(const ma_spatializer* pSpatializer)
@@ -36981,7 +37693,7 @@ MA_API float ma_spatializer_get_directional_attenuation_factor(const ma_spatiali
         return 1;
     }
 
-    return pSpatializer->config.directionalAttenuationFactor;
+    return c89atomic_load_f32(&pSpatializer->directionalAttenuationFactor);
 }
 
 MA_API void ma_spatializer_set_position(ma_spatializer* pSpatializer, float x, float y, float z)
@@ -37056,7 +37768,7 @@ MA_API void ma_spatializer_get_relative_position_and_direction(const ma_spatiali
         return;
     }
 
-    if (pListener == NULL || pSpatializer->config.positioning == ma_positioning_relative) {
+    if (pListener == NULL || ma_spatializer_get_positioning(pSpatializer) == ma_positioning_relative) {
         /* There's no listener or we're using relative positioning. */
         if (pRelativePos != NULL) {
             *pRelativePos = pSpatializer->position;
@@ -37804,6 +38516,14 @@ MA_API ma_result ma_linear_resampler_set_rate_ratio(ma_linear_resampler* pResamp
     ma_uint32 n;
     ma_uint32 d;
 
+    if (pResampler == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (ratioInOut <= 0) {
+        return MA_INVALID_ARGS;
+    }
+
     d = 1000;
     n = (ma_uint32)(ratioInOut * d);
 
@@ -38230,6 +38950,10 @@ MA_API ma_result ma_resampler_set_rate_ratio(ma_resampler* pResampler, float rat
     ma_uint32 d;
 
     if (pResampler == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    if (ratio <= 0) {
         return MA_INVALID_ARGS;
     }
 
@@ -43084,6 +43808,60 @@ MA_API ma_result ma_data_source_get_length_in_pcm_frames(ma_data_source* pDataSo
     }
 
     return pDataSourceBase->vtable->onGetLength(pDataSource, pLength);
+}
+
+MA_API ma_result ma_data_source_get_cursor_in_seconds(ma_data_source* pDataSource, float* pCursor)
+{
+    ma_result result;
+    ma_uint64 cursorInPCMFrames;
+    ma_uint32 sampleRate;
+
+    if (pCursor == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pCursor = 0;
+
+    result = ma_data_source_get_cursor_in_pcm_frames(pDataSource, &cursorInPCMFrames);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    result = ma_data_source_get_data_format(pDataSource, NULL, NULL, &sampleRate, NULL, 0);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pCursor = cursorInPCMFrames / (float)sampleRate;
+
+    return MA_SUCCESS;
+}
+
+MA_API ma_result ma_data_source_get_length_in_seconds(ma_data_source* pDataSource, float* pLength)
+{
+    ma_result result;
+    ma_uint64 lengthInPCMFrames;
+    ma_uint32 sampleRate;
+
+    if (pLength == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    *pLength = 0;
+
+    result = ma_data_source_get_length_in_pcm_frames(pDataSource, &lengthInPCMFrames);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    result = ma_data_source_get_data_format(pDataSource, NULL, NULL, &sampleRate, NULL, 0);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    *pLength = lengthInPCMFrames / (float)sampleRate;
+
+    return MA_SUCCESS;
 }
 
 MA_API ma_result ma_data_source_set_looping(ma_data_source* pDataSource, ma_bool32 isLooping)
@@ -50656,17 +51434,27 @@ MA_API ma_result ma_decode_memory(const void* pData, size_t dataSize, ma_decoder
 static size_t ma_encoder__internal_on_write_wav(void* pUserData, const void* pData, size_t bytesToWrite)
 {
     ma_encoder* pEncoder = (ma_encoder*)pUserData;
+    size_t bytesWritten = 0;
+
     MA_ASSERT(pEncoder != NULL);
 
-    return pEncoder->onWrite(pEncoder, pData, bytesToWrite);
+    pEncoder->onWrite(pEncoder, pData, bytesToWrite, &bytesWritten);
+    return bytesWritten;
 }
 
 static drwav_bool32 ma_encoder__internal_on_seek_wav(void* pUserData, int offset, drwav_seek_origin origin)
 {
     ma_encoder* pEncoder = (ma_encoder*)pUserData;
+    ma_result result;
+
     MA_ASSERT(pEncoder != NULL);
 
-    return pEncoder->onSeek(pEncoder, offset, (origin == drwav_seek_origin_start) ? ma_seek_origin_start : ma_seek_origin_current);
+    result = pEncoder->onSeek(pEncoder, offset, (origin == drwav_seek_origin_start) ? ma_seek_origin_start : ma_seek_origin_current);
+    if (result != MA_SUCCESS) {
+        return DRWAV_FALSE;
+    } else {
+        return DRWAV_TRUE;
+    }
 }
 
 static ma_result ma_encoder__on_init_wav(ma_encoder* pEncoder)
@@ -50817,64 +51605,85 @@ MA_API ma_result ma_encoder_init__internal(ma_encoder_write_proc onWrite, ma_enc
     /* Getting here means we should have our backend callbacks set up. */
     if (result == MA_SUCCESS) {
         result = pEncoder->onInit(pEncoder);
-        if (result != MA_SUCCESS) {
-            return result;
-        }
+    }
+
+    return result;
+}
+
+static ma_result ma_encoder__on_write_vfs(ma_encoder* pEncoder, const void* pBufferIn, size_t bytesToWrite, size_t* pBytesWritten)
+{
+    return ma_vfs_or_default_write(pEncoder->data.vfs.pVFS, pEncoder->data.vfs.file, pBufferIn, bytesToWrite, pBytesWritten);
+}
+
+static ma_result ma_encoder__on_seek_vfs(ma_encoder* pEncoder, ma_int64 offset, ma_seek_origin origin)
+{
+    return ma_vfs_or_default_seek(pEncoder->data.vfs.pVFS, pEncoder->data.vfs.file, offset, origin);
+}
+
+MA_API ma_result ma_encoder_init_vfs(ma_vfs* pVFS, const char* pFilePath, const ma_encoder_config* pConfig, ma_encoder* pEncoder)
+{
+    ma_result result;
+    ma_vfs_file file;
+
+    result = ma_encoder_preinit(pConfig, pEncoder);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    /* Now open the file. If this fails we don't need to uninitialize the encoder. */
+    result = ma_vfs_or_default_open(pVFS, pFilePath, MA_OPEN_MODE_WRITE, &file);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    pEncoder->data.vfs.pVFS = pVFS;
+    pEncoder->data.vfs.file = file;
+
+    result = ma_encoder_init__internal(ma_encoder__on_write_vfs, ma_encoder__on_seek_vfs, NULL, pEncoder);
+    if (result != MA_SUCCESS) {
+        ma_vfs_or_default_close(pVFS, file);
+        return result;
     }
 
     return MA_SUCCESS;
 }
 
-MA_API size_t ma_encoder__on_write_stdio(ma_encoder* pEncoder, const void* pBufferIn, size_t bytesToWrite)
+MA_API ma_result ma_encoder_init_vfs_w(ma_vfs* pVFS, const wchar_t* pFilePath, const ma_encoder_config* pConfig, ma_encoder* pEncoder)
 {
-    return fwrite(pBufferIn, 1, bytesToWrite, (FILE*)pEncoder->pFile);
-}
+    ma_result result;
+    ma_vfs_file file;
 
-MA_API ma_bool32 ma_encoder__on_seek_stdio(ma_encoder* pEncoder, int byteOffset, ma_seek_origin origin)
-{
-    return fseek((FILE*)pEncoder->pFile, byteOffset, (origin == ma_seek_origin_current) ? SEEK_CUR : SEEK_SET) == 0;
+    result = ma_encoder_preinit(pConfig, pEncoder);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    /* Now open the file. If this fails we don't need to uninitialize the encoder. */
+    result = ma_vfs_or_default_open_w(pVFS, pFilePath, MA_OPEN_MODE_WRITE, &file);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+    pEncoder->data.vfs.pVFS = pVFS;
+    pEncoder->data.vfs.file = file;
+
+    result = ma_encoder_init__internal(ma_encoder__on_write_vfs, ma_encoder__on_seek_vfs, NULL, pEncoder);
+    if (result != MA_SUCCESS) {
+        ma_vfs_or_default_close(pVFS, file);
+        return result;
+    }
+
+    return MA_SUCCESS;
 }
 
 MA_API ma_result ma_encoder_init_file(const char* pFilePath, const ma_encoder_config* pConfig, ma_encoder* pEncoder)
 {
-    ma_result result;
-    FILE* pFile;
-
-    result = ma_encoder_preinit(pConfig, pEncoder);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    /* Now open the file. If this fails we don't need to uninitialize the encoder. */
-    result = ma_fopen(&pFile, pFilePath, "wb");
-    if (pFile == NULL) {
-        return result;
-    }
-
-    pEncoder->pFile = pFile;
-
-    return ma_encoder_init__internal(ma_encoder__on_write_stdio, ma_encoder__on_seek_stdio, NULL, pEncoder);
+    return ma_encoder_init_vfs(NULL, pFilePath, pConfig, pEncoder);
 }
 
 MA_API ma_result ma_encoder_init_file_w(const wchar_t* pFilePath, const ma_encoder_config* pConfig, ma_encoder* pEncoder)
 {
-    ma_result result;
-    FILE* pFile;
-
-    result = ma_encoder_preinit(pConfig, pEncoder);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    /* Now open the file. If this fails we don't need to uninitialize the encoder. */
-    result = ma_wfopen(&pFile, pFilePath, L"wb", &pEncoder->config.allocationCallbacks);
-    if (pFile == NULL) {
-        return result;
-    }
-
-    pEncoder->pFile = pFile;
-
-    return ma_encoder_init__internal(ma_encoder__on_write_stdio, ma_encoder__on_seek_stdio, NULL, pEncoder);
+    return ma_encoder_init_vfs_w(NULL, pFilePath, pConfig, pEncoder);
 }
 
 MA_API ma_result ma_encoder_init(ma_encoder_write_proc onWrite, ma_encoder_seek_proc onSeek, void* pUserData, const ma_encoder_config* pConfig, ma_encoder* pEncoder)
@@ -50901,8 +51710,9 @@ MA_API void ma_encoder_uninit(ma_encoder* pEncoder)
     }
 
     /* If we have a file handle, close it. */
-    if (pEncoder->onWrite == ma_encoder__on_write_stdio) {
-        fclose((FILE*)pEncoder->pFile);
+    if (pEncoder->onWrite == ma_encoder__on_write_vfs) {
+        ma_vfs_or_default_close(pEncoder->data.vfs.pVFS, pEncoder->data.vfs.file);
+        pEncoder->data.vfs.file = NULL;
     }
 }
 
@@ -51951,8 +52761,8 @@ MA_API ma_result ma_noise_read_pcm_frames(ma_noise* pNoise, void* pFramesOut, ma
 #define MA_RESOURCE_MANAGER_PAGE_SIZE_IN_MILLISECONDS   1000
 #endif
 
-#ifndef MA_RESOURCE_MANAGER_JOB_QUEUE_CAPACITY
-#define MA_RESOURCE_MANAGER_JOB_QUEUE_CAPACITY          1024
+#ifndef MA_JOB_TYPE_RESOURCE_MANAGER_QUEUE_CAPACITY
+#define MA_JOB_TYPE_RESOURCE_MANAGER_QUEUE_CAPACITY          1024
 #endif
 
 MA_API ma_resource_manager_pipeline_notifications ma_resource_manager_pipeline_notifications_init(void)
@@ -51993,412 +52803,6 @@ static void ma_resource_manager_pipeline_notifications_release_all_fences(const 
     if (pPipelineNotifications->init.pFence != NULL) { ma_fence_release(pPipelineNotifications->init.pFence); }
     if (pPipelineNotifications->done.pFence != NULL) { ma_fence_release(pPipelineNotifications->done.pFence); }
 }
-
-
-
-#define MA_RESOURCE_MANAGER_JOB_ID_NONE      ~((ma_uint64)0)
-#define MA_RESOURCE_MANAGER_JOB_SLOT_NONE    (ma_uint16)(~0)
-
-static MA_INLINE ma_uint32 ma_resource_manager_job_extract_refcount(ma_uint64 toc)
-{
-    return (ma_uint32)(toc >> 32);
-}
-
-static MA_INLINE ma_uint16 ma_resource_manager_job_extract_slot(ma_uint64 toc)
-{
-    return (ma_uint16)(toc & 0x0000FFFF);
-}
-
-static MA_INLINE ma_uint16 ma_resource_manager_job_extract_code(ma_uint64 toc)
-{
-    return (ma_uint16)((toc & 0xFFFF0000) >> 16);
-}
-
-static MA_INLINE ma_uint64 ma_resource_manager_job_toc_to_allocation(ma_uint64 toc)
-{
-    return ((ma_uint64)ma_resource_manager_job_extract_refcount(toc) << 32) | (ma_uint64)ma_resource_manager_job_extract_slot(toc);
-}
-
-static MA_INLINE ma_uint64 ma_resource_manager_job_set_refcount(ma_uint64 toc, ma_uint32 refcount)
-{
-    /* Clear the reference count first. */
-    toc = toc & ~((ma_uint64)0xFFFFFFFF << 32);
-    toc = toc |  ((ma_uint64)refcount   << 32);
-
-    return toc;
-}
-
-
-MA_API ma_resource_manager_job ma_resource_manager_job_init(ma_uint16 code)
-{
-    ma_resource_manager_job job;
-
-    MA_ZERO_OBJECT(&job);
-    job.toc.breakup.code = code;
-    job.toc.breakup.slot = MA_RESOURCE_MANAGER_JOB_SLOT_NONE;    /* Temp value. Will be allocated when posted to a queue. */
-    job.next             = MA_RESOURCE_MANAGER_JOB_ID_NONE;
-
-    return job;
-}
-
-
-
-MA_API ma_resource_manager_job_queue_config ma_resource_manager_job_queue_config_init(ma_uint32 flags, ma_uint32 capacity)
-{
-    ma_resource_manager_job_queue_config config;
-
-    config.flags    = flags;
-    config.capacity = capacity;
-
-    return config;
-}
-
-
-typedef struct
-{
-    size_t sizeInBytes;
-    size_t allocatorOffset;
-    size_t jobsOffset;
-} ma_resource_manager_job_queue_heap_layout;
-
-static ma_result ma_resource_manager_job_queue_get_heap_layout(const ma_resource_manager_job_queue_config* pConfig, ma_resource_manager_job_queue_heap_layout* pHeapLayout)
-{
-    ma_result result;
-
-    MA_ASSERT(pHeapLayout != NULL);
-
-    MA_ZERO_OBJECT(pHeapLayout);
-
-    if (pConfig == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    if (pConfig->capacity == 0) {
-        return MA_INVALID_ARGS;
-    }
-
-    pHeapLayout->sizeInBytes = 0;
-
-    /* Allocator. */
-    {
-        ma_slot_allocator_config allocatorConfig;
-        size_t allocatorHeapSizeInBytes;
-
-        allocatorConfig = ma_slot_allocator_config_init(pConfig->capacity);
-        result = ma_slot_allocator_get_heap_size(&allocatorConfig, &allocatorHeapSizeInBytes);
-        if (result != MA_SUCCESS) {
-            return result;
-        }
-
-        pHeapLayout->allocatorOffset = pHeapLayout->sizeInBytes;
-        pHeapLayout->sizeInBytes    += allocatorHeapSizeInBytes;
-    }
-
-    /* Jobs. */
-    pHeapLayout->jobsOffset   = pHeapLayout->sizeInBytes;
-    pHeapLayout->sizeInBytes += ma_align_64(pConfig->capacity * sizeof(ma_resource_manager_job));
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_resource_manager_job_queue_get_heap_size(const ma_resource_manager_job_queue_config* pConfig, size_t* pHeapSizeInBytes)
-{
-    ma_result result;
-    ma_resource_manager_job_queue_heap_layout layout;
-
-    if (pHeapSizeInBytes == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    *pHeapSizeInBytes = 0;
-
-    result = ma_resource_manager_job_queue_get_heap_layout(pConfig, &layout);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    *pHeapSizeInBytes = layout.sizeInBytes;
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_resource_manager_job_queue_init_preallocated(const ma_resource_manager_job_queue_config* pConfig, void* pHeap, ma_resource_manager_job_queue* pQueue)
-{
-    ma_result result;
-    ma_resource_manager_job_queue_heap_layout heapLayout;
-    ma_slot_allocator_config allocatorConfig;
-
-    if (pQueue == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    MA_ZERO_OBJECT(pQueue);
-
-    result = ma_resource_manager_job_queue_get_heap_layout(pConfig, &heapLayout);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    pQueue->_pHeap = pHeap;
-    MA_ZERO_MEMORY(pHeap, heapLayout.sizeInBytes);
-
-    pQueue->flags    = pConfig->flags;
-    pQueue->capacity = pConfig->capacity;
-    pQueue->pJobs    = (ma_resource_manager_job*)ma_offset_ptr(pHeap, heapLayout.jobsOffset);
-
-    allocatorConfig = ma_slot_allocator_config_init(pConfig->capacity);
-    result = ma_slot_allocator_init_preallocated(&allocatorConfig, ma_offset_ptr(pHeap, heapLayout.allocatorOffset), &pQueue->allocator);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    /* We need a semaphore if we're running in non-blocking mode. If threading is disabled we need to return an error. */
-    if ((pQueue->flags & MA_RESOURCE_MANAGER_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
-        #ifndef MA_NO_THREADING
-        {
-            ma_semaphore_init(0, &pQueue->sem);
-        }
-        #else
-        {
-            /* Threading is disabled and we've requested non-blocking mode. */
-            return MA_INVALID_OPERATION;
-        }
-        #endif
-    }
-
-    /*
-    Our queue needs to be initialized with a free standing node. This should always be slot 0. Required for the lock free algorithm. The first job in the queue is
-    just a dummy item for giving us the first item in the list which is stored in the "next" member.
-    */
-    ma_slot_allocator_alloc(&pQueue->allocator, &pQueue->head);  /* Will never fail. */
-    pQueue->pJobs[ma_resource_manager_job_extract_slot(pQueue->head)].next = MA_RESOURCE_MANAGER_JOB_ID_NONE;
-    pQueue->tail = pQueue->head;
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_resource_manager_job_queue_init(const ma_resource_manager_job_queue_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_resource_manager_job_queue* pQueue)
-{
-    ma_result result;
-    size_t heapSizeInBytes;
-    void* pHeap;
-
-    result = ma_resource_manager_job_queue_get_heap_size(pConfig, &heapSizeInBytes);
-    if (result != MA_SUCCESS) {
-        return result;
-    }
-
-    if (heapSizeInBytes > 0) {
-        pHeap = ma_malloc(heapSizeInBytes, pAllocationCallbacks);
-        if (pHeap == NULL) {
-            return MA_OUT_OF_MEMORY;
-        }
-    } else {
-        pHeap = NULL;
-    }
-
-    result = ma_resource_manager_job_queue_init_preallocated(pConfig, pHeap, pQueue);
-    if (result != MA_SUCCESS) {
-        ma_free(pHeap, pAllocationCallbacks);
-        return result;
-    }
-
-    pQueue->_ownsHeap = MA_TRUE;
-    return MA_SUCCESS;
-}
-
-MA_API void ma_resource_manager_job_queue_uninit(ma_resource_manager_job_queue* pQueue, const ma_allocation_callbacks* pAllocationCallbacks)
-{
-    if (pQueue == NULL) {
-        return;
-    }
-
-    /* All we need to do is uninitialize the semaphore. */
-    if ((pQueue->flags & MA_RESOURCE_MANAGER_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
-        #ifndef MA_NO_THREADING
-        {
-            ma_semaphore_uninit(&pQueue->sem);
-        }
-        #else
-        {
-            MA_ASSERT(MA_FALSE);    /* Should never get here. Should have been checked at initialization time. */
-        }
-        #endif
-    }
-
-    ma_slot_allocator_uninit(&pQueue->allocator, pAllocationCallbacks);
-
-    if (pQueue->_ownsHeap) {
-        ma_free(pQueue->_pHeap, pAllocationCallbacks);
-    }
-}
-
-static ma_bool32 ma_resource_manager_job_queue_cas(volatile ma_uint64* dst, ma_uint64 expected, ma_uint64 desired)
-{
-    /* The new counter is taken from the expected value. */
-    return c89atomic_compare_and_swap_64(dst, expected, ma_resource_manager_job_set_refcount(desired, ma_resource_manager_job_extract_refcount(expected) + 1)) == expected;
-}
-
-MA_API ma_result ma_resource_manager_job_queue_post(ma_resource_manager_job_queue* pQueue, const ma_resource_manager_job* pJob)
-{
-    /*
-    Lock free queue implementation based on the paper by Michael and Scott: Nonblocking Algorithms and Preemption-Safe Locking on Multiprogrammed Shared Memory Multiprocessors
-    */
-    ma_result result;
-    ma_uint64 slot;
-    ma_uint64 tail;
-    ma_uint64 next;
-
-    if (pQueue == NULL || pJob == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    /* We need a new slot. */
-    result = ma_slot_allocator_alloc(&pQueue->allocator, &slot);
-    if (result != MA_SUCCESS) {
-        return result;  /* Probably ran out of slots. If so, MA_OUT_OF_MEMORY will be returned. */
-    }
-
-    /* At this point we should have a slot to place the job. */
-    MA_ASSERT(ma_resource_manager_job_extract_slot(slot) < pQueue->capacity);
-
-    /* We need to put the job into memory before we do anything. */
-    pQueue->pJobs[ma_resource_manager_job_extract_slot(slot)]                  = *pJob;
-    pQueue->pJobs[ma_resource_manager_job_extract_slot(slot)].toc.allocation   = slot;                    /* This will overwrite the job code. */
-    pQueue->pJobs[ma_resource_manager_job_extract_slot(slot)].toc.breakup.code = pJob->toc.breakup.code;  /* The job code needs to be applied again because the line above overwrote it. */
-    pQueue->pJobs[ma_resource_manager_job_extract_slot(slot)].next             = MA_RESOURCE_MANAGER_JOB_ID_NONE;          /* Reset for safety. */
-
-    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
-    ma_spinlock_lock(&pQueue->lock);
-    #endif
-    {
-        /* The job is stored in memory so now we need to add it to our linked list. We only ever add items to the end of the list. */
-        for (;;) {
-            tail = c89atomic_load_64(&pQueue->tail);
-            next = c89atomic_load_64(&pQueue->pJobs[ma_resource_manager_job_extract_slot(tail)].next);
-
-            if (ma_resource_manager_job_toc_to_allocation(tail) == ma_resource_manager_job_toc_to_allocation(c89atomic_load_64(&pQueue->tail))) {
-                if (ma_resource_manager_job_extract_slot(next) == 0xFFFF) {
-                    if (ma_resource_manager_job_queue_cas(&pQueue->pJobs[ma_resource_manager_job_extract_slot(tail)].next, next, slot)) {
-                        break;
-                    }
-                } else {
-                    ma_resource_manager_job_queue_cas(&pQueue->tail, tail, ma_resource_manager_job_extract_slot(next));
-                }
-            }
-        }
-        ma_resource_manager_job_queue_cas(&pQueue->tail, tail, slot);
-    }
-    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
-    ma_spinlock_unlock(&pQueue->lock);
-    #endif
-
-
-    /* Signal the semaphore as the last step if we're using synchronous mode. */
-    if ((pQueue->flags & MA_RESOURCE_MANAGER_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
-        #ifndef MA_NO_THREADING
-        {
-            ma_semaphore_release(&pQueue->sem);
-        }
-        #else
-        {
-            MA_ASSERT(MA_FALSE);    /* Should never get here. Should have been checked at initialization time. */
-        }
-        #endif
-    }
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_resource_manager_job_queue_next(ma_resource_manager_job_queue* pQueue, ma_resource_manager_job* pJob)
-{
-    ma_uint64 head;
-    ma_uint64 tail;
-    ma_uint64 next;
-
-    if (pQueue == NULL || pJob == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    /* If we're running in synchronous mode we'll need to wait on a semaphore. */
-    if ((pQueue->flags & MA_RESOURCE_MANAGER_JOB_QUEUE_FLAG_NON_BLOCKING) == 0) {
-        #ifndef MA_NO_THREADING
-        {
-            ma_semaphore_wait(&pQueue->sem);
-        }
-        #else
-        {
-            MA_ASSERT(MA_FALSE);    /* Should never get here. Should have been checked at initialization time. */
-        }
-        #endif
-    }
-
-    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
-    ma_spinlock_lock(&pQueue->lock);
-    #endif
-    {
-        /*
-        BUG: In lock-free mode, multiple threads can be in this section of code. The "head" variable in the loop below
-        is stored. One thread can fall through to the freeing of this item while another is still using "head" for the
-        retrieval of the "next" variable.
-
-        The slot allocator might need to make use of some reference counting to ensure it's only truely freed when
-        there are no more references to the item. This must be fixed before removing these locks.
-        */
-
-        /* Now we need to remove the root item from the list. */
-        for (;;) {
-            head = c89atomic_load_64(&pQueue->head);
-            tail = c89atomic_load_64(&pQueue->tail);
-            next = c89atomic_load_64(&pQueue->pJobs[ma_resource_manager_job_extract_slot(head)].next);
-
-            if (ma_resource_manager_job_toc_to_allocation(head) == ma_resource_manager_job_toc_to_allocation(c89atomic_load_64(&pQueue->head))) {
-                if (ma_resource_manager_job_extract_slot(head) == ma_resource_manager_job_extract_slot(tail)) {
-                    if (ma_resource_manager_job_extract_slot(next) == 0xFFFF) {
-                        #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
-                        ma_spinlock_unlock(&pQueue->lock);
-                        #endif
-                        return MA_NO_DATA_AVAILABLE;
-                    }
-                    ma_resource_manager_job_queue_cas(&pQueue->tail, tail, ma_resource_manager_job_extract_slot(next));
-                } else {
-                    *pJob = pQueue->pJobs[ma_resource_manager_job_extract_slot(next)];
-                    if (ma_resource_manager_job_queue_cas(&pQueue->head, head, ma_resource_manager_job_extract_slot(next))) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    #ifndef MA_USE_EXPERIMENTAL_LOCK_FREE_JOB_QUEUE
-    ma_spinlock_unlock(&pQueue->lock);
-    #endif
-
-    ma_slot_allocator_free(&pQueue->allocator, head);
-
-    /*
-    If it's a quit job make sure it's put back on the queue to ensure other threads have an opportunity to detect it and terminate naturally. We
-    could instead just leave it on the queue, but that would involve fiddling with the lock-free code above and I want to keep that as simple as
-    possible.
-    */
-    if (pJob->toc.breakup.code == MA_RESOURCE_MANAGER_JOB_QUIT) {
-        ma_resource_manager_job_queue_post(pQueue, pJob);
-        return MA_CANCELLED;    /* Return a cancelled status just in case the thread is checking return codes and not properly checking for a quit job. */
-    }
-
-    return MA_SUCCESS;
-}
-
-MA_API ma_result ma_resource_manager_job_queue_free(ma_resource_manager_job_queue* pQueue, ma_resource_manager_job* pJob)
-{
-    if (pQueue == NULL || pJob == NULL) {
-        return MA_INVALID_ARGS;
-    }
-
-    return ma_slot_allocator_free(&pQueue->allocator, ma_resource_manager_job_toc_to_allocation(pJob->toc.allocation));
-}
-
-
 
 
 
@@ -52983,7 +53387,7 @@ static ma_thread_result MA_THREADCALL ma_resource_manager_job_thread(void* pUser
 
     for (;;) {
         ma_result result;
-        ma_resource_manager_job job;
+        ma_job job;
 
         result = ma_resource_manager_next_job(pResourceManager, &job);
         if (result != MA_SUCCESS) {
@@ -52991,11 +53395,11 @@ static ma_thread_result MA_THREADCALL ma_resource_manager_job_thread(void* pUser
         }
 
         /* Terminate if we got a quit message. */
-        if (job.toc.breakup.code == MA_RESOURCE_MANAGER_JOB_QUIT) {
+        if (job.toc.breakup.code == MA_JOB_TYPE_QUIT) {
             break;
         }
 
-        ma_resource_manager_process_job(pResourceManager, &job);
+        ma_job_process(&job);
     }
 
     return (ma_thread_result)0;
@@ -53011,7 +53415,7 @@ MA_API ma_resource_manager_config ma_resource_manager_config_init(void)
     config.decodedChannels   = 0;
     config.decodedSampleRate = 0;
     config.jobThreadCount    = 1;   /* A single miniaudio-managed job thread by default. */
-    config.jobQueueCapacity  = MA_RESOURCE_MANAGER_JOB_QUEUE_CAPACITY;
+    config.jobQueueCapacity  = MA_JOB_TYPE_RESOURCE_MANAGER_QUEUE_CAPACITY;
 
     /* Flags. */
     config.flags = 0;
@@ -53030,7 +53434,7 @@ MA_API ma_resource_manager_config ma_resource_manager_config_init(void)
 MA_API ma_result ma_resource_manager_init(const ma_resource_manager_config* pConfig, ma_resource_manager* pResourceManager)
 {
     ma_result result;
-    ma_resource_manager_job_queue_config jobQueueConfig;
+    ma_job_queue_config jobQueueConfig;
 
     if (pResourceManager == NULL) {
         return MA_INVALID_ARGS;
@@ -53097,10 +53501,10 @@ MA_API ma_result ma_resource_manager_init(const ma_resource_manager_config* pCon
             return MA_INVALID_ARGS; /* Non-blocking mode is only valid for self-managed job threads. */
         }
 
-        jobQueueConfig.flags |= MA_RESOURCE_MANAGER_JOB_QUEUE_FLAG_NON_BLOCKING;
+        jobQueueConfig.flags |= MA_JOB_QUEUE_FLAG_NON_BLOCKING;
     }
 
-    result = ma_resource_manager_job_queue_init(&jobQueueConfig, &pResourceManager->config.allocationCallbacks, &pResourceManager->jobQueue);
+    result = ma_job_queue_init(&jobQueueConfig, &pResourceManager->config.allocationCallbacks, &pResourceManager->jobQueue);
     if (result != MA_SUCCESS) {
         return result;
     }
@@ -53112,7 +53516,7 @@ MA_API ma_result ma_resource_manager_init(const ma_resource_manager_config* pCon
 
         pResourceManager->config.ppCustomDecodingBackendVTables = (ma_decoding_backend_vtable**)ma_malloc(sizeInBytes, &pResourceManager->config.allocationCallbacks);
         if (pResourceManager->config.ppCustomDecodingBackendVTables == NULL) {
-            ma_resource_manager_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
+            ma_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
             return MA_OUT_OF_MEMORY;
         }
 
@@ -53133,7 +53537,7 @@ MA_API ma_result ma_resource_manager_init(const ma_resource_manager_config* pCon
             /* Data buffer lock. */
             result = ma_mutex_init(&pResourceManager->dataBufferBSTLock);
             if (result != MA_SUCCESS) {
-                ma_resource_manager_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
+                ma_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
                 return result;
             }
 
@@ -53142,7 +53546,7 @@ MA_API ma_result ma_resource_manager_init(const ma_resource_manager_config* pCon
                 result = ma_thread_create(&pResourceManager->jobThreads[iJobThread], ma_thread_priority_normal, 0, ma_resource_manager_job_thread, pResourceManager, &pResourceManager->config.allocationCallbacks);
                 if (result != MA_SUCCESS) {
                     ma_mutex_uninit(&pResourceManager->dataBufferBSTLock);
-                    ma_resource_manager_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
+                    ma_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
                     return result;
                 }
             }
@@ -53206,7 +53610,7 @@ MA_API void ma_resource_manager_uninit(ma_resource_manager* pResourceManager)
     ma_resource_manager_delete_all_data_buffer_nodes(pResourceManager);
 
     /* The job queue is no longer needed. */
-    ma_resource_manager_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
+    ma_job_queue_uninit(&pResourceManager->jobQueue, &pResourceManager->config.allocationCallbacks);
 
     /* We're no longer doing anything with data buffers so the lock can now be uninitialized. */
     if (ma_resource_manager_is_threading_enabled(pResourceManager)) {
@@ -53697,7 +54101,7 @@ static ma_result ma_resource_manager_data_buffer_node_acquire_critical_section(m
         */
         if (pDataBufferNode->isDataOwnedByResourceManager && (flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_ASYNC) != 0) {
             /* Loading asynchronously. Post the job. */
-            ma_resource_manager_job job;
+            ma_job job;
             char* pFilePathCopy = NULL;
             wchar_t* pFilePathWCopy = NULL;
 
@@ -53723,21 +54127,22 @@ static ma_result ma_resource_manager_data_buffer_node_acquire_critical_section(m
             if (pDoneFence != NULL) { ma_fence_acquire(pDoneFence); }
 
             /* We now have everything we need to post the job to the job thread. */
-            job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_LOAD_DATA_BUFFER_NODE);
+            job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_BUFFER_NODE);
             job.order = ma_resource_manager_data_buffer_node_next_execution_order(pDataBufferNode);
-            job.data.loadDataBufferNode.pDataBufferNode   = pDataBufferNode;
-            job.data.loadDataBufferNode.pFilePath         = pFilePathCopy;
-            job.data.loadDataBufferNode.pFilePathW        = pFilePathWCopy;
-            job.data.loadDataBufferNode.decode            =  (flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_DECODE   ) != 0;
-            job.data.loadDataBufferNode.pInitNotification = ((flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_WAIT_INIT) != 0) ? pInitNotification : NULL;
-            job.data.loadDataBufferNode.pDoneNotification = NULL;
-            job.data.loadDataBufferNode.pInitFence        = pInitFence;
-            job.data.loadDataBufferNode.pDoneFence        = pDoneFence;
+            job.data.resourceManager.loadDataBufferNode.pResourceManager  = pResourceManager;
+            job.data.resourceManager.loadDataBufferNode.pDataBufferNode   = pDataBufferNode;
+            job.data.resourceManager.loadDataBufferNode.pFilePath         = pFilePathCopy;
+            job.data.resourceManager.loadDataBufferNode.pFilePathW        = pFilePathWCopy;
+            job.data.resourceManager.loadDataBufferNode.decode            =  (flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_DECODE   ) != 0;
+            job.data.resourceManager.loadDataBufferNode.pInitNotification = ((flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_WAIT_INIT) != 0) ? pInitNotification : NULL;
+            job.data.resourceManager.loadDataBufferNode.pDoneNotification = NULL;
+            job.data.resourceManager.loadDataBufferNode.pInitFence        = pInitFence;
+            job.data.resourceManager.loadDataBufferNode.pDoneFence        = pDoneFence;
 
             result = ma_resource_manager_post_job(pResourceManager, &job);
             if (result != MA_SUCCESS) {
                 /* Failed to post job. Probably ran out of memory. */
-                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_RESOURCE_MANAGER_JOB_LOAD_DATA_BUFFER_NODE job. %s.\n", ma_result_description(result));
+                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_BUFFER_NODE job. %s.\n", ma_result_description(result));
 
                 /*
                 Fences were acquired before posting the job, but since the job was not able to
@@ -53984,18 +54389,19 @@ stage2:
     if (refCount == 0) {
         if (ma_resource_manager_data_buffer_node_result(pDataBufferNode) == MA_BUSY) {
             /* The sound is still loading. We need to delay the freeing of the node to a safe time. */
-            ma_resource_manager_job job;
+            ma_job job;
 
             /* We need to mark the node as unavailable for the sake of the resource manager worker threads. */
             c89atomic_exchange_i32(&pDataBufferNode->result, MA_UNAVAILABLE);
 
-            job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER_NODE);
+            job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER_NODE);
             job.order = ma_resource_manager_data_buffer_node_next_execution_order(pDataBufferNode);
-            job.data.freeDataBufferNode.pDataBufferNode = pDataBufferNode;
+            job.data.resourceManager.freeDataBufferNode.pResourceManager = pResourceManager;
+            job.data.resourceManager.freeDataBufferNode.pDataBufferNode  = pDataBufferNode;
 
             result = ma_resource_manager_post_job(pResourceManager, &job);
             if (result != MA_SUCCESS) {
-                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER_NODE job. %s.\n", ma_result_description(result));
+                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER_NODE job. %s.\n", ma_result_description(result));
                 return result;
             }
 
@@ -54152,7 +54558,7 @@ static ma_result ma_resource_manager_data_buffer_init_ex_internal(ma_resource_ma
             goto done;
         } else {
             /* The node's data supply isn't initialized yet. The caller has requested that we load asynchronously so we need to post a job to do this. */
-            ma_resource_manager_job job;
+            ma_job job;
             ma_resource_manager_inline_notification initNotification;   /* Used when the WAIT_INIT flag is set. */
 
             if ((flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_WAIT_INIT) != 0) {
@@ -54169,18 +54575,18 @@ static ma_result ma_resource_manager_data_buffer_init_ex_internal(ma_resource_ma
             /* Acquire fences a second time. These will be released by the async thread. */
             ma_resource_manager_pipeline_notifications_acquire_all_fences(&notifications);
 
-            job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_LOAD_DATA_BUFFER);
+            job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_BUFFER);
             job.order = ma_resource_manager_data_buffer_next_execution_order(pDataBuffer);
-            job.data.loadDataBuffer.pDataBuffer       = pDataBuffer;
-            job.data.loadDataBuffer.pInitNotification = ((flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_WAIT_INIT) != 0) ? &initNotification : notifications.init.pNotification;
-            job.data.loadDataBuffer.pDoneNotification = notifications.done.pNotification;
-            job.data.loadDataBuffer.pInitFence        = notifications.init.pFence;
-            job.data.loadDataBuffer.pDoneFence        = notifications.done.pFence;
+            job.data.resourceManager.loadDataBuffer.pDataBuffer       = pDataBuffer;
+            job.data.resourceManager.loadDataBuffer.pInitNotification = ((flags & MA_RESOURCE_MANAGER_DATA_SOURCE_FLAG_WAIT_INIT) != 0) ? &initNotification : notifications.init.pNotification;
+            job.data.resourceManager.loadDataBuffer.pDoneNotification = notifications.done.pNotification;
+            job.data.resourceManager.loadDataBuffer.pInitFence        = notifications.init.pFence;
+            job.data.resourceManager.loadDataBuffer.pDoneFence        = notifications.done.pFence;
 
             result = ma_resource_manager_post_job(pResourceManager, &job);
             if (result != MA_SUCCESS) {
                 /* We failed to post the job. Most likely there isn't enough room in the queue's buffer. */
-                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_RESOURCE_MANAGER_JOB_LOAD_DATA_BUFFER job. %s.\n", ma_result_description(result));
+                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_BUFFER job. %s.\n", ma_result_description(result));
                 c89atomic_exchange_i32(&pDataBuffer->result, result);
 
                 /* Release the fences after the result has been set on the data buffer. */
@@ -54304,7 +54710,7 @@ MA_API ma_result ma_resource_manager_data_buffer_uninit(ma_resource_manager_data
         to get processed before returning.
         */
         ma_resource_manager_inline_notification notification;
-        ma_resource_manager_job job;
+        ma_job job;
 
         /*
         We need to mark the node as unavailable so we don't try reading from it anymore, but also to
@@ -54317,11 +54723,11 @@ MA_API ma_result ma_resource_manager_data_buffer_uninit(ma_resource_manager_data
             return result;  /* Failed to create the notification. This should rarely, if ever, happen. */
         }
 
-        job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER);
+        job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER);
         job.order = ma_resource_manager_data_buffer_next_execution_order(pDataBuffer);
-        job.data.freeDataBuffer.pDataBuffer       = pDataBuffer;
-        job.data.freeDataBuffer.pDoneNotification = &notification;
-        job.data.freeDataBuffer.pDoneFence        = NULL;
+        job.data.resourceManager.freeDataBuffer.pDataBuffer       = pDataBuffer;
+        job.data.resourceManager.freeDataBuffer.pDoneNotification = &notification;
+        job.data.resourceManager.freeDataBuffer.pDoneFence        = NULL;
 
         result = ma_resource_manager_post_job(pDataBuffer->pResourceManager, &job);
         if (result != MA_SUCCESS) {
@@ -54799,7 +55205,7 @@ MA_API ma_result ma_resource_manager_data_stream_init_ex(ma_resource_manager* pR
     ma_data_source_config dataSourceConfig;
     char* pFilePathCopy = NULL;
     wchar_t* pFilePathWCopy = NULL;
-    ma_resource_manager_job job;
+    ma_job job;
     ma_bool32 waitBeforeReturning = MA_FALSE;
     ma_resource_manager_inline_notification waitNotification;
     ma_resource_manager_pipeline_notifications notifications;
@@ -54875,14 +55281,14 @@ MA_API ma_result ma_resource_manager_data_stream_init_ex(ma_resource_manager* pR
     ma_resource_manager_data_stream_set_absolute_cursor(pDataStream, pConfig->initialSeekPointInPCMFrames);
 
     /* We now have everything we need to post the job. This is the last thing we need to do from here. The rest will be done by the job thread. */
-    job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_LOAD_DATA_STREAM);
+    job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_LOAD_DATA_STREAM);
     job.order = ma_resource_manager_data_stream_next_execution_order(pDataStream);
-    job.data.loadDataStream.pDataStream       = pDataStream;
-    job.data.loadDataStream.pFilePath         = pFilePathCopy;
-    job.data.loadDataStream.pFilePathW        = pFilePathWCopy;
-    job.data.loadDataStream.initialSeekPoint  = pConfig->initialSeekPointInPCMFrames;
-    job.data.loadDataStream.pInitNotification = (waitBeforeReturning == MA_TRUE) ? &waitNotification : notifications.init.pNotification;
-    job.data.loadDataStream.pInitFence        = notifications.init.pFence;
+    job.data.resourceManager.loadDataStream.pDataStream       = pDataStream;
+    job.data.resourceManager.loadDataStream.pFilePath         = pFilePathCopy;
+    job.data.resourceManager.loadDataStream.pFilePathW        = pFilePathWCopy;
+    job.data.resourceManager.loadDataStream.initialSeekPoint  = pConfig->initialSeekPointInPCMFrames;
+    job.data.resourceManager.loadDataStream.pInitNotification = (waitBeforeReturning == MA_TRUE) ? &waitNotification : notifications.init.pNotification;
+    job.data.resourceManager.loadDataStream.pInitFence        = notifications.init.pFence;
     result = ma_resource_manager_post_job(pResourceManager, &job);
     if (result != MA_SUCCESS) {
         ma_resource_manager_pipeline_notifications_signal_all_notifications(&notifications);
@@ -54938,7 +55344,7 @@ MA_API ma_result ma_resource_manager_data_stream_init_w(ma_resource_manager* pRe
 MA_API ma_result ma_resource_manager_data_stream_uninit(ma_resource_manager_data_stream* pDataStream)
 {
     ma_resource_manager_inline_notification freeEvent;
-    ma_resource_manager_job job;
+    ma_job job;
 
     if (pDataStream == NULL) {
         return MA_INVALID_ARGS;
@@ -54953,11 +55359,11 @@ MA_API ma_result ma_resource_manager_data_stream_uninit(ma_resource_manager_data
     */
     ma_resource_manager_inline_notification_init(pDataStream->pResourceManager, &freeEvent);
 
-    job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_FREE_DATA_STREAM);
+    job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_STREAM);
     job.order = ma_resource_manager_data_stream_next_execution_order(pDataStream);
-    job.data.freeDataStream.pDataStream       = pDataStream;
-    job.data.freeDataStream.pDoneNotification = &freeEvent;
-    job.data.freeDataStream.pDoneFence        = NULL;
+    job.data.resourceManager.freeDataStream.pDataStream       = pDataStream;
+    job.data.resourceManager.freeDataStream.pDoneNotification = &freeEvent;
+    job.data.resourceManager.freeDataStream.pDoneFence        = NULL;
     ma_resource_manager_post_job(pDataStream->pResourceManager, &job);
 
     /* We need to wait for the job to finish processing before we return. */
@@ -55099,7 +55505,7 @@ static ma_result ma_resource_manager_data_stream_unmap(ma_resource_manager_data_
 {
     ma_uint32 newRelativeCursor;
     ma_uint32 pageSizeInFrames;
-    ma_resource_manager_job job;
+    ma_job job;
 
     /* We cannot be using the data source after it's been uninitialized. */
     MA_ASSERT(ma_resource_manager_data_stream_result(pDataStream) != MA_UNAVAILABLE);
@@ -55130,10 +55536,10 @@ static ma_result ma_resource_manager_data_stream_unmap(ma_resource_manager_data_
         newRelativeCursor -= pageSizeInFrames;
 
         /* Here is where we post the job start decoding. */
-        job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_PAGE_DATA_STREAM);
+        job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_PAGE_DATA_STREAM);
         job.order = ma_resource_manager_data_stream_next_execution_order(pDataStream);
-        job.data.pageDataStream.pDataStream = pDataStream;
-        job.data.pageDataStream.pageIndex   = pDataStream->currentPageIndex;
+        job.data.resourceManager.pageDataStream.pDataStream = pDataStream;
+        job.data.resourceManager.pageDataStream.pageIndex   = pDataStream->currentPageIndex;
 
         /* The page needs to be marked as invalid so that the public API doesn't try reading from it. */
         c89atomic_exchange_32(&pDataStream->isPageValid[pDataStream->currentPageIndex], MA_FALSE);
@@ -55222,7 +55628,7 @@ MA_API ma_result ma_resource_manager_data_stream_read_pcm_frames(ma_resource_man
 
 MA_API ma_result ma_resource_manager_data_stream_seek_to_pcm_frame(ma_resource_manager_data_stream* pDataStream, ma_uint64 frameIndex)
 {
-    ma_resource_manager_job job;
+    ma_job job;
     ma_result streamResult;
 
     streamResult = ma_resource_manager_data_stream_result(pDataStream);
@@ -55261,10 +55667,10 @@ MA_API ma_result ma_resource_manager_data_stream_seek_to_pcm_frame(ma_resource_m
     The public API is not allowed to touch the internal decoder so we need to use a job to perform the seek. When seeking, the job thread will assume both pages
     are invalid and any content contained within them will be discarded and replaced with newly decoded data.
     */
-    job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_SEEK_DATA_STREAM);
+    job = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_SEEK_DATA_STREAM);
     job.order = ma_resource_manager_data_stream_next_execution_order(pDataStream);
-    job.data.seekDataStream.pDataStream = pDataStream;
-    job.data.seekDataStream.frameIndex  = frameIndex;
+    job.data.resourceManager.seekDataStream.pDataStream = pDataStream;
+    job.data.resourceManager.seekDataStream.frameIndex  = frameIndex;
     return ma_resource_manager_post_job(pDataStream->pResourceManager, &job);
 }
 
@@ -55690,47 +56096,49 @@ MA_API ma_result ma_resource_manager_data_source_get_available_frames(ma_resourc
 }
 
 
-MA_API ma_result ma_resource_manager_post_job(ma_resource_manager* pResourceManager, const ma_resource_manager_job* pJob)
+MA_API ma_result ma_resource_manager_post_job(ma_resource_manager* pResourceManager, const ma_job* pJob)
 {
     if (pResourceManager == NULL) {
         return MA_INVALID_ARGS;
     }
 
-    return ma_resource_manager_job_queue_post(&pResourceManager->jobQueue, pJob);
+    return ma_job_queue_post(&pResourceManager->jobQueue, pJob);
 }
 
 MA_API ma_result ma_resource_manager_post_job_quit(ma_resource_manager* pResourceManager)
 {
-    ma_resource_manager_job job = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_QUIT);
+    ma_job job = ma_job_init(MA_JOB_TYPE_QUIT);
     return ma_resource_manager_post_job(pResourceManager, &job);
 }
 
-MA_API ma_result ma_resource_manager_next_job(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+MA_API ma_result ma_resource_manager_next_job(ma_resource_manager* pResourceManager, ma_job* pJob)
 {
     if (pResourceManager == NULL) {
         return MA_INVALID_ARGS;
     }
 
-    return ma_resource_manager_job_queue_next(&pResourceManager->jobQueue, pJob);
+    return ma_job_queue_next(&pResourceManager->jobQueue, pJob);
 }
 
 
-static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__load_data_buffer_node(ma_job* pJob)
 {
     ma_result result = MA_SUCCESS;
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_buffer_node* pDataBufferNode;
 
-    MA_ASSERT(pResourceManager != NULL);
     MA_ASSERT(pJob != NULL);
 
-    pDataBufferNode = pJob->data.loadDataBufferNode.pDataBufferNode;
+    pResourceManager = (ma_resource_manager*)pJob->data.resourceManager.loadDataBufferNode.pResourceManager;
+    MA_ASSERT(pResourceManager != NULL);
 
+    pDataBufferNode = (ma_resource_manager_data_buffer_node*)pJob->data.resourceManager.loadDataBufferNode.pDataBufferNode;
     MA_ASSERT(pDataBufferNode != NULL);
     MA_ASSERT(pDataBufferNode->isDataOwnedByResourceManager == MA_TRUE);  /* The data should always be owned by the resource manager. */
 
     /* The data buffer is not getting deleted, but we may be getting executed out of order. If so, we need to push the job back onto the queue and return. */
     if (pJob->order != c89atomic_load_32(&pDataBufferNode->executionPointer)) {
-        return ma_resource_manager_post_job(pResourceManager, pJob);    /* Attempting to execute out of order. Probably interleaved with a MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER job. */
+        return ma_resource_manager_post_job(pResourceManager, pJob);    /* Attempting to execute out of order. Probably interleaved with a MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER job. */
     }
 
     /* First thing we need to do is check whether or not the data buffer is getting deleted. If so we just abort. */
@@ -55748,7 +56156,7 @@ static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resou
     will determine that the node is available for data delivery and the data buffer connectors can be
     initialized. Therefore, it's important that it is set after the data supply has been initialized.
     */
-    if (pJob->data.loadDataBufferNode.decode) {
+    if (pJob->data.resourceManager.loadDataBufferNode.decode) {
         /*
         Decoding. This is the complex case because we're not going to be doing the entire decoding
         process here. Instead it's going to be split of multiple jobs and loaded in pages. The
@@ -55764,10 +56172,10 @@ static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resou
         the node will be in a state where data buffer connectors can be initialized.
         */
         ma_decoder* pDecoder;   /* <-- Free'd on the last page decode. */
-        ma_resource_manager_job pageDataBufferNodeJob;
+        ma_job pageDataBufferNodeJob;
 
         /* Allocate the decoder by initializing a decoded data supply. */
-        result = ma_resource_manager_data_buffer_node_init_supply_decoded(pResourceManager, pDataBufferNode, pJob->data.loadDataBufferNode.pFilePath, pJob->data.loadDataBufferNode.pFilePathW, &pDecoder);
+        result = ma_resource_manager_data_buffer_node_init_supply_decoded(pResourceManager, pDataBufferNode, pJob->data.resourceManager.loadDataBufferNode.pFilePath, pJob->data.resourceManager.loadDataBufferNode.pFilePathW, &pDecoder);
 
         /*
         Don't ever propagate an MA_BUSY result code or else the resource manager will think the
@@ -55779,11 +56187,11 @@ static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resou
         }
 
         if (result != MA_SUCCESS) {
-            if (pJob->data.loadDataBufferNode.pFilePath != NULL) {
-                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_WARNING, "Failed to initialize data supply for \"%s\". %s.\n", pJob->data.loadDataBufferNode.pFilePath, ma_result_description(result));
+            if (pJob->data.resourceManager.loadDataBufferNode.pFilePath != NULL) {
+                ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_WARNING, "Failed to initialize data supply for \"%s\". %s.\n", pJob->data.resourceManager.loadDataBufferNode.pFilePath, ma_result_description(result));
             } else {
                 #if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L) || defined(_MSC_VER)
-                    ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_WARNING, "Failed to initialize data supply for \"%ls\", %s.\n", pJob->data.loadDataBufferNode.pFilePathW, ma_result_description(result));
+                    ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_WARNING, "Failed to initialize data supply for \"%ls\", %s.\n", pJob->data.resourceManager.loadDataBufferNode.pFilePathW, ma_result_description(result));
                 #endif
             }
 
@@ -55798,12 +56206,13 @@ static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resou
 
         Note that if an error occurred at an earlier point, this section will have been skipped.
         */
-        pageDataBufferNodeJob = ma_resource_manager_job_init(MA_RESOURCE_MANAGER_JOB_PAGE_DATA_BUFFER_NODE);
+        pageDataBufferNodeJob = ma_job_init(MA_JOB_TYPE_RESOURCE_MANAGER_PAGE_DATA_BUFFER_NODE);
         pageDataBufferNodeJob.order = ma_resource_manager_data_buffer_node_next_execution_order(pDataBufferNode);
-        pageDataBufferNodeJob.data.pageDataBufferNode.pDataBufferNode   = pDataBufferNode;
-        pageDataBufferNodeJob.data.pageDataBufferNode.pDecoder          = pDecoder;
-        pageDataBufferNodeJob.data.pageDataBufferNode.pDoneNotification = pJob->data.loadDataBufferNode.pDoneNotification;
-        pageDataBufferNodeJob.data.pageDataBufferNode.pDoneFence        = pJob->data.loadDataBufferNode.pDoneFence;
+        pageDataBufferNodeJob.data.resourceManager.pageDataBufferNode.pResourceManager  = pResourceManager;
+        pageDataBufferNodeJob.data.resourceManager.pageDataBufferNode.pDataBufferNode   = pDataBufferNode;
+        pageDataBufferNodeJob.data.resourceManager.pageDataBufferNode.pDecoder          = pDecoder;
+        pageDataBufferNodeJob.data.resourceManager.pageDataBufferNode.pDoneNotification = pJob->data.resourceManager.loadDataBufferNode.pDoneNotification;
+        pageDataBufferNodeJob.data.resourceManager.pageDataBufferNode.pDoneFence        = pJob->data.resourceManager.loadDataBufferNode.pDoneFence;
 
         /* The job has been set up so it can now be posted. */
         result = ma_resource_manager_post_job(pResourceManager, &pageDataBufferNodeJob);
@@ -55815,7 +56224,7 @@ static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resou
         is set to MA_BUSY.
         */
         if (result != MA_SUCCESS) {
-            ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_RESOURCE_MANAGER_JOB_PAGE_DATA_BUFFER_NODE job. %s\n", ma_result_description(result));
+            ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to post MA_JOB_TYPE_RESOURCE_MANAGER_PAGE_DATA_BUFFER_NODE job. %s\n", ma_result_description(result));
             ma_decoder_uninit(pDecoder);
             ma_free(pDecoder, &pResourceManager->config.allocationCallbacks);
         } else {
@@ -55823,14 +56232,14 @@ static ma_result ma_resource_manager_process_job__load_data_buffer_node(ma_resou
         }
     } else {
         /* No decoding. This is the simple case. We need only read the file content into memory and we're done. */
-        result = ma_resource_manager_data_buffer_node_init_supply_encoded(pResourceManager, pDataBufferNode, pJob->data.loadDataBufferNode.pFilePath, pJob->data.loadDataBufferNode.pFilePathW);
+        result = ma_resource_manager_data_buffer_node_init_supply_encoded(pResourceManager, pDataBufferNode, pJob->data.resourceManager.loadDataBufferNode.pFilePath, pJob->data.resourceManager.loadDataBufferNode.pFilePathW);
     }
 
 
 done:
     /* File paths are no longer needed. */
-    ma_free(pJob->data.loadDataBufferNode.pFilePath,  &pResourceManager->config.allocationCallbacks);
-    ma_free(pJob->data.loadDataBufferNode.pFilePathW, &pResourceManager->config.allocationCallbacks);
+    ma_free(pJob->data.resourceManager.loadDataBufferNode.pFilePath,  &pResourceManager->config.allocationCallbacks);
+    ma_free(pJob->data.resourceManager.loadDataBufferNode.pFilePathW, &pResourceManager->config.allocationCallbacks);
 
     /*
     We need to set the result to at the very end to ensure no other threads try reading the data before we've fully initialized the object. Other threads
@@ -55842,20 +56251,20 @@ done:
     c89atomic_compare_and_swap_i32(&pDataBufferNode->result, MA_BUSY, result);
 
     /* At this point initialization is complete and we can signal the notification if any. */
-    if (pJob->data.loadDataBufferNode.pInitNotification != NULL) {
-        ma_async_notification_signal(pJob->data.loadDataBufferNode.pInitNotification);
+    if (pJob->data.resourceManager.loadDataBufferNode.pInitNotification != NULL) {
+        ma_async_notification_signal(pJob->data.resourceManager.loadDataBufferNode.pInitNotification);
     }
-    if (pJob->data.loadDataBufferNode.pInitFence != NULL) {
-        ma_fence_release(pJob->data.loadDataBufferNode.pInitFence);
+    if (pJob->data.resourceManager.loadDataBufferNode.pInitFence != NULL) {
+        ma_fence_release(pJob->data.resourceManager.loadDataBufferNode.pInitFence);
     }
 
     /* If we have a success result it means we've fully loaded the buffer. This will happen in the non-decoding case. */
     if (result != MA_BUSY) {
-        if (pJob->data.loadDataBufferNode.pDoneNotification != NULL) {
-            ma_async_notification_signal(pJob->data.loadDataBufferNode.pDoneNotification);
+        if (pJob->data.resourceManager.loadDataBufferNode.pDoneNotification != NULL) {
+            ma_async_notification_signal(pJob->data.resourceManager.loadDataBufferNode.pDoneNotification);
         }
-        if (pJob->data.loadDataBufferNode.pDoneFence != NULL) {
-            ma_fence_release(pJob->data.loadDataBufferNode.pDoneFence);
+        if (pJob->data.resourceManager.loadDataBufferNode.pDoneFence != NULL) {
+            ma_fence_release(pJob->data.resourceManager.loadDataBufferNode.pDoneFence);
         }
     }
 
@@ -55864,15 +56273,17 @@ done:
     return result;
 }
 
-static ma_result ma_resource_manager_process_job__free_data_buffer_node(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__free_data_buffer_node(ma_job* pJob)
 {
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_buffer_node* pDataBufferNode;
 
+    MA_ASSERT(pJob != NULL);
+
+    pResourceManager = (ma_resource_manager*)pJob->data.resourceManager.freeDataBufferNode.pResourceManager;
     MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
 
-    pDataBufferNode = pJob->data.freeDataBufferNode.pDataBufferNode;
-
+    pDataBufferNode = (ma_resource_manager_data_buffer_node*)pJob->data.resourceManager.freeDataBufferNode.pDataBufferNode;
     MA_ASSERT(pDataBufferNode != NULL);
 
     if (pJob->order != c89atomic_load_32(&pDataBufferNode->executionPointer)) {
@@ -55882,27 +56293,30 @@ static ma_result ma_resource_manager_process_job__free_data_buffer_node(ma_resou
     ma_resource_manager_data_buffer_node_free(pResourceManager, pDataBufferNode);
 
     /* The event needs to be signalled last. */
-    if (pJob->data.freeDataBufferNode.pDoneNotification != NULL) {
-        ma_async_notification_signal(pJob->data.freeDataBufferNode.pDoneNotification);
+    if (pJob->data.resourceManager.freeDataBufferNode.pDoneNotification != NULL) {
+        ma_async_notification_signal(pJob->data.resourceManager.freeDataBufferNode.pDoneNotification);
     }
 
-    if (pJob->data.freeDataBufferNode.pDoneFence != NULL) {
-        ma_fence_release(pJob->data.freeDataBufferNode.pDoneFence);
+    if (pJob->data.resourceManager.freeDataBufferNode.pDoneFence != NULL) {
+        ma_fence_release(pJob->data.resourceManager.freeDataBufferNode.pDoneFence);
     }
 
     c89atomic_fetch_add_32(&pDataBufferNode->executionPointer, 1);
     return MA_SUCCESS;
 }
 
-static ma_result ma_resource_manager_process_job__page_data_buffer_node(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__page_data_buffer_node(ma_job* pJob)
 {
     ma_result result = MA_SUCCESS;
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_buffer_node* pDataBufferNode;
 
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataBufferNode = pJob->data.pageDataBufferNode.pDataBufferNode;
+    pResourceManager = (ma_resource_manager*)pJob->data.resourceManager.pageDataBufferNode.pResourceManager;
+    MA_ASSERT(pResourceManager != NULL);
+
+    pDataBufferNode = (ma_resource_manager_data_buffer_node*)pJob->data.resourceManager.pageDataBufferNode.pDataBufferNode;
     MA_ASSERT(pDataBufferNode != NULL);
 
     if (pJob->order != c89atomic_load_32(&pDataBufferNode->executionPointer)) {
@@ -55916,14 +56330,14 @@ static ma_result ma_resource_manager_process_job__page_data_buffer_node(ma_resou
     }
 
     /* We're ready to decode the next page. */
-    result = ma_resource_manager_data_buffer_node_decode_next_page(pResourceManager, pDataBufferNode, pJob->data.pageDataBufferNode.pDecoder);
+    result = ma_resource_manager_data_buffer_node_decode_next_page(pResourceManager, pDataBufferNode, (ma_decoder*)pJob->data.resourceManager.pageDataBufferNode.pDecoder);
 
     /*
     If we have a success code by this point, we want to post another job. We're going to set the
     result back to MA_BUSY to make it clear that there's still more to load.
     */
     if (result == MA_SUCCESS) {
-        ma_resource_manager_job newJob;
+        ma_job newJob;
         newJob = *pJob; /* Everything is the same as the input job, except the execution order. */
         newJob.order = ma_resource_manager_data_buffer_node_next_execution_order(pDataBufferNode);   /* We need a fresh execution order. */
 
@@ -55938,8 +56352,8 @@ static ma_result ma_resource_manager_process_job__page_data_buffer_node(ma_resou
 done:
     /* If there's still more to decode the result will be set to MA_BUSY. Otherwise we can free the decoder. */
     if (result != MA_BUSY) {
-        ma_decoder_uninit(pJob->data.pageDataBufferNode.pDecoder);
-        ma_free(pJob->data.pageDataBufferNode.pDecoder, &pResourceManager->config.allocationCallbacks);
+        ma_decoder_uninit((ma_decoder*)pJob->data.resourceManager.pageDataBufferNode.pDecoder);
+        ma_free(pJob->data.resourceManager.pageDataBufferNode.pDecoder, &pResourceManager->config.allocationCallbacks);
     }
 
     /* If we reached the end we need to treat it as successful. */
@@ -55952,12 +56366,12 @@ done:
 
     /* Signal the notification after setting the result in case the notification callback wants to inspect the result code. */
     if (result != MA_BUSY) {
-        if (pJob->data.pageDataBufferNode.pDoneNotification != NULL) {
-            ma_async_notification_signal(pJob->data.pageDataBufferNode.pDoneNotification);
+        if (pJob->data.resourceManager.pageDataBufferNode.pDoneNotification != NULL) {
+            ma_async_notification_signal(pJob->data.resourceManager.pageDataBufferNode.pDoneNotification);
         }
 
-        if (pJob->data.pageDataBufferNode.pDoneFence != NULL) {
-            ma_fence_release(pJob->data.pageDataBufferNode.pDoneFence);
+        if (pJob->data.resourceManager.pageDataBufferNode.pDoneFence != NULL) {
+            ma_fence_release(pJob->data.resourceManager.pageDataBufferNode.pDoneFence);
         }
     }
 
@@ -55966,9 +56380,10 @@ done:
 }
 
 
-static ma_result ma_resource_manager_process_job__load_data_buffer(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__load_data_buffer(ma_job* pJob)
 {
     ma_result result = MA_SUCCESS;
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_buffer* pDataBuffer;
     ma_resource_manager_data_supply_type dataSupplyType = ma_resource_manager_data_supply_type_unknown;
     ma_bool32 isConnectorInitialized = MA_FALSE;
@@ -55977,14 +56392,15 @@ static ma_result ma_resource_manager_process_job__load_data_buffer(ma_resource_m
     All we're doing here is checking if the node has finished loading. If not, we just re-post the job
     and keep waiting. Otherwise we increment the execution counter and set the buffer's result code.
     */
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataBuffer = pJob->data.loadDataBuffer.pDataBuffer;
+    pDataBuffer = (ma_resource_manager_data_buffer*)pJob->data.resourceManager.loadDataBuffer.pDataBuffer;
     MA_ASSERT(pDataBuffer != NULL);
 
+    pResourceManager = pDataBuffer->pResourceManager;
+
     if (pJob->order != c89atomic_load_32(&pDataBuffer->executionPointer)) {
-        return ma_resource_manager_post_job(pResourceManager, pJob);    /* Attempting to execute out of order. Probably interleaved with a MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER job. */
+        return ma_resource_manager_post_job(pResourceManager, pJob);    /* Attempting to execute out of order. Probably interleaved with a MA_JOB_TYPE_RESOURCE_MANAGER_FREE_DATA_BUFFER job. */
     }
 
     /*
@@ -56005,7 +56421,7 @@ static ma_result ma_resource_manager_process_job__load_data_buffer(ma_resource_m
 
         if (dataSupplyType != ma_resource_manager_data_supply_type_unknown) {
             /* We can now initialize the connector. If this fails, we need to abort. It's very rare for this to fail. */
-            result = ma_resource_manager_data_buffer_init_connector(pDataBuffer, pJob->data.loadDataBuffer.pInitNotification, pJob->data.loadDataBuffer.pInitFence);
+            result = ma_resource_manager_data_buffer_init_connector(pDataBuffer, pJob->data.resourceManager.loadDataBuffer.pInitNotification, pJob->data.resourceManager.loadDataBuffer.pInitFence);
             if (result != MA_SUCCESS) {
                 ma_log_postf(ma_resource_manager_get_log(pResourceManager), MA_LOG_LEVEL_ERROR, "Failed to initialize connector for data buffer. %s.\n", ma_result_description(result));
                 goto done;
@@ -56033,14 +56449,14 @@ static ma_result ma_resource_manager_process_job__load_data_buffer(ma_resource_m
 
 done:
     /* Only move away from a busy code so that we don't trash any existing error codes. */
-    c89atomic_compare_and_swap_i32(&pJob->data.loadDataBuffer.pDataBuffer->result, MA_BUSY, result);
+    c89atomic_compare_and_swap_i32(&pDataBuffer->result, MA_BUSY, result);
 
     /* Only signal the other threads after the result has been set just for cleanliness sake. */
-    if (pJob->data.loadDataBuffer.pDoneNotification != NULL) {
-        ma_async_notification_signal(pJob->data.loadDataBuffer.pDoneNotification);
+    if (pJob->data.resourceManager.loadDataBuffer.pDoneNotification != NULL) {
+        ma_async_notification_signal(pJob->data.resourceManager.loadDataBuffer.pDoneNotification);
     }
-    if (pJob->data.loadDataBuffer.pDoneFence != NULL) {
-        ma_fence_release(pJob->data.loadDataBuffer.pDoneFence);
+    if (pJob->data.resourceManager.loadDataBuffer.pDoneFence != NULL) {
+        ma_fence_release(pJob->data.resourceManager.loadDataBuffer.pDoneFence);
     }
 
     /*
@@ -56048,11 +56464,11 @@ done:
     notification event was never signalled which means we need to signal it here.
     */
     if (pDataBuffer->isConnectorInitialized == MA_FALSE && result != MA_SUCCESS) {
-        if (pJob->data.loadDataBuffer.pInitNotification != NULL) {
-            ma_async_notification_signal(pJob->data.loadDataBuffer.pInitNotification);
+        if (pJob->data.resourceManager.loadDataBuffer.pInitNotification != NULL) {
+            ma_async_notification_signal(pJob->data.resourceManager.loadDataBuffer.pInitNotification);
         }
-        if (pJob->data.loadDataBuffer.pInitFence != NULL) {
-            ma_fence_release(pJob->data.loadDataBuffer.pInitFence);
+        if (pJob->data.resourceManager.loadDataBuffer.pInitFence != NULL) {
+            ma_fence_release(pJob->data.resourceManager.loadDataBuffer.pInitFence);
         }
     }
 
@@ -56060,15 +56476,17 @@ done:
     return result;
 }
 
-static ma_result ma_resource_manager_process_job__free_data_buffer(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__free_data_buffer(ma_job* pJob)
 {
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_buffer* pDataBuffer;
 
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataBuffer = pJob->data.freeDataBuffer.pDataBuffer;
+    pDataBuffer = (ma_resource_manager_data_buffer*)pJob->data.resourceManager.freeDataBuffer.pDataBuffer;
     MA_ASSERT(pDataBuffer != NULL);
+
+    pResourceManager = pDataBuffer->pResourceManager;
 
     if (pJob->order != c89atomic_load_32(&pDataBuffer->executionPointer)) {
         return ma_resource_manager_post_job(pResourceManager, pJob);    /* Out of order. */
@@ -56077,30 +56495,32 @@ static ma_result ma_resource_manager_process_job__free_data_buffer(ma_resource_m
     ma_resource_manager_data_buffer_uninit_internal(pDataBuffer);
 
     /* The event needs to be signalled last. */
-    if (pJob->data.freeDataBuffer.pDoneNotification != NULL) {
-        ma_async_notification_signal(pJob->data.freeDataBuffer.pDoneNotification);
+    if (pJob->data.resourceManager.freeDataBuffer.pDoneNotification != NULL) {
+        ma_async_notification_signal(pJob->data.resourceManager.freeDataBuffer.pDoneNotification);
     }
 
-    if (pJob->data.freeDataBuffer.pDoneFence != NULL) {
-        ma_fence_release(pJob->data.freeDataBuffer.pDoneFence);
+    if (pJob->data.resourceManager.freeDataBuffer.pDoneFence != NULL) {
+        ma_fence_release(pJob->data.resourceManager.freeDataBuffer.pDoneFence);
     }
 
     c89atomic_fetch_add_32(&pDataBuffer->executionPointer, 1);
     return MA_SUCCESS;
 }
 
-static ma_result ma_resource_manager_process_job__load_data_stream(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__load_data_stream(ma_job* pJob)
 {
     ma_result result = MA_SUCCESS;
     ma_decoder_config decoderConfig;
     ma_uint32 pageBufferSizeInBytes;
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_stream* pDataStream;
 
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataStream = pJob->data.loadDataStream.pDataStream;
+    pDataStream = (ma_resource_manager_data_stream*)pJob->data.resourceManager.loadDataStream.pDataStream;
     MA_ASSERT(pDataStream != NULL);
+
+    pResourceManager = pDataStream->pResourceManager;
 
     if (pJob->order != c89atomic_load_32(&pDataStream->executionPointer)) {
         return ma_resource_manager_post_job(pResourceManager, pJob);    /* Out of order. */
@@ -56114,10 +56534,10 @@ static ma_result ma_resource_manager_process_job__load_data_stream(ma_resource_m
     /* We need to initialize the decoder first so we can determine the size of the pages. */
     decoderConfig = ma_resource_manager__init_decoder_config(pResourceManager);
 
-    if (pJob->data.loadDataStream.pFilePath != NULL) {
-        result = ma_decoder_init_vfs(pResourceManager->config.pVFS, pJob->data.loadDataStream.pFilePath, &decoderConfig, &pDataStream->decoder);
+    if (pJob->data.resourceManager.loadDataStream.pFilePath != NULL) {
+        result = ma_decoder_init_vfs(pResourceManager->config.pVFS, pJob->data.resourceManager.loadDataStream.pFilePath, &decoderConfig, &pDataStream->decoder);
     } else {
-        result = ma_decoder_init_vfs_w(pResourceManager->config.pVFS, pJob->data.loadDataStream.pFilePathW, &decoderConfig, &pDataStream->decoder);
+        result = ma_decoder_init_vfs_w(pResourceManager->config.pVFS, pJob->data.resourceManager.loadDataStream.pFilePathW, &decoderConfig, &pDataStream->decoder);
     }
     if (result != MA_SUCCESS) {
         goto done;
@@ -56146,7 +56566,7 @@ static ma_result ma_resource_manager_process_job__load_data_stream(ma_resource_m
     }
 
     /* Seek to our initial seek point before filling the initial pages. */
-    ma_decoder_seek_to_pcm_frame(&pDataStream->decoder, pJob->data.loadDataStream.initialSeekPoint);
+    ma_decoder_seek_to_pcm_frame(&pDataStream->decoder, pJob->data.resourceManager.loadDataStream.initialSeekPoint);
 
     /* We have our decoder and our page buffer, so now we need to fill our pages. */
     ma_resource_manager_data_stream_fill_pages(pDataStream);
@@ -56155,33 +56575,35 @@ static ma_result ma_resource_manager_process_job__load_data_stream(ma_resource_m
     result = MA_SUCCESS;
 
 done:
-    ma_free(pJob->data.loadDataStream.pFilePath,  &pResourceManager->config.allocationCallbacks);
-    ma_free(pJob->data.loadDataStream.pFilePathW, &pResourceManager->config.allocationCallbacks);
+    ma_free(pJob->data.resourceManager.loadDataStream.pFilePath,  &pResourceManager->config.allocationCallbacks);
+    ma_free(pJob->data.resourceManager.loadDataStream.pFilePathW, &pResourceManager->config.allocationCallbacks);
 
     /* We can only change the status away from MA_BUSY. If it's set to anything else it means an error has occurred somewhere or the uninitialization process has started (most likely). */
     c89atomic_compare_and_swap_i32(&pDataStream->result, MA_BUSY, result);
 
     /* Only signal the other threads after the result has been set just for cleanliness sake. */
-    if (pJob->data.loadDataStream.pInitNotification != NULL) {
-        ma_async_notification_signal(pJob->data.loadDataStream.pInitNotification);
+    if (pJob->data.resourceManager.loadDataStream.pInitNotification != NULL) {
+        ma_async_notification_signal(pJob->data.resourceManager.loadDataStream.pInitNotification);
     }
-    if (pJob->data.loadDataStream.pInitFence != NULL) {
-        ma_fence_release(pJob->data.loadDataStream.pInitFence);
+    if (pJob->data.resourceManager.loadDataStream.pInitFence != NULL) {
+        ma_fence_release(pJob->data.resourceManager.loadDataStream.pInitFence);
     }
 
     c89atomic_fetch_add_32(&pDataStream->executionPointer, 1);
     return result;
 }
 
-static ma_result ma_resource_manager_process_job__free_data_stream(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__free_data_stream(ma_job* pJob)
 {
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_stream* pDataStream;
 
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataStream = pJob->data.freeDataStream.pDataStream;
+    pDataStream = (ma_resource_manager_data_stream*)pJob->data.resourceManager.freeDataStream.pDataStream;
     MA_ASSERT(pDataStream != NULL);
+
+    pResourceManager = pDataStream->pResourceManager;
 
     if (pJob->order != c89atomic_load_32(&pDataStream->executionPointer)) {
         return ma_resource_manager_post_job(pResourceManager, pJob);    /* Out of order. */
@@ -56202,27 +56624,29 @@ static ma_result ma_resource_manager_process_job__free_data_stream(ma_resource_m
     ma_data_source_uninit(&pDataStream->ds);
 
     /* The event needs to be signalled last. */
-    if (pJob->data.freeDataStream.pDoneNotification != NULL) {
-        ma_async_notification_signal(pJob->data.freeDataStream.pDoneNotification);
+    if (pJob->data.resourceManager.freeDataStream.pDoneNotification != NULL) {
+        ma_async_notification_signal(pJob->data.resourceManager.freeDataStream.pDoneNotification);
     }
-    if (pJob->data.freeDataStream.pDoneFence != NULL) {
-        ma_fence_release(pJob->data.freeDataStream.pDoneFence);
+    if (pJob->data.resourceManager.freeDataStream.pDoneFence != NULL) {
+        ma_fence_release(pJob->data.resourceManager.freeDataStream.pDoneFence);
     }
 
     /*c89atomic_fetch_add_32(&pDataStream->executionPointer, 1);*/
     return MA_SUCCESS;
 }
 
-static ma_result ma_resource_manager_process_job__page_data_stream(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__page_data_stream(ma_job* pJob)
 {
     ma_result result = MA_SUCCESS;
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_stream* pDataStream;
 
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataStream = pJob->data.pageDataStream.pDataStream;
+    pDataStream = (ma_resource_manager_data_stream*)pJob->data.resourceManager.pageDataStream.pDataStream;
     MA_ASSERT(pDataStream != NULL);
+
+    pResourceManager = pDataStream->pResourceManager;
 
     if (pJob->order != c89atomic_load_32(&pDataStream->executionPointer)) {
         return ma_resource_manager_post_job(pResourceManager, pJob);    /* Out of order. */
@@ -56234,23 +56658,25 @@ static ma_result ma_resource_manager_process_job__page_data_stream(ma_resource_m
         goto done;
     }
 
-    ma_resource_manager_data_stream_fill_page(pDataStream, pJob->data.pageDataStream.pageIndex);
+    ma_resource_manager_data_stream_fill_page(pDataStream, pJob->data.resourceManager.pageDataStream.pageIndex);
 
 done:
     c89atomic_fetch_add_32(&pDataStream->executionPointer, 1);
     return result;
 }
 
-static ma_result ma_resource_manager_process_job__seek_data_stream(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+static ma_result ma_job_process__resource_manager__seek_data_stream(ma_job* pJob)
 {
     ma_result result = MA_SUCCESS;
+    ma_resource_manager* pResourceManager;
     ma_resource_manager_data_stream* pDataStream;
 
-    MA_ASSERT(pResourceManager != NULL);
-    MA_ASSERT(pJob             != NULL);
+    MA_ASSERT(pJob != NULL);
 
-    pDataStream = pJob->data.seekDataStream.pDataStream;
+    pDataStream = (ma_resource_manager_data_stream*)pJob->data.resourceManager.seekDataStream.pDataStream;
     MA_ASSERT(pDataStream != NULL);
+
+    pResourceManager = pDataStream->pResourceManager;
 
     if (pJob->order != c89atomic_load_32(&pDataStream->executionPointer)) {
         return ma_resource_manager_post_job(pResourceManager, pJob);    /* Out of order. */
@@ -56266,7 +56692,7 @@ static ma_result ma_resource_manager_process_job__seek_data_stream(ma_resource_m
     With seeking we just assume both pages are invalid and the relative frame cursor at position 0. This is basically exactly the same as loading, except
     instead of initializing the decoder, we seek to a frame.
     */
-    ma_decoder_seek_to_pcm_frame(&pDataStream->decoder, pJob->data.seekDataStream.frameIndex);
+    ma_decoder_seek_to_pcm_frame(&pDataStream->decoder, pJob->data.resourceManager.seekDataStream.frameIndex);
 
     /* After seeking we'll need to reload the pages. */
     ma_resource_manager_data_stream_fill_pages(pDataStream);
@@ -56279,40 +56705,19 @@ done:
     return result;
 }
 
-MA_API ma_result ma_resource_manager_process_job(ma_resource_manager* pResourceManager, ma_resource_manager_job* pJob)
+MA_API ma_result ma_resource_manager_process_job(ma_resource_manager* pResourceManager, ma_job* pJob)
 {
     if (pResourceManager == NULL || pJob == NULL) {
         return MA_INVALID_ARGS;
     }
 
-    switch (pJob->toc.breakup.code)
-    {
-        /* Data Buffer Node */
-        case MA_RESOURCE_MANAGER_JOB_LOAD_DATA_BUFFER_NODE: return ma_resource_manager_process_job__load_data_buffer_node(pResourceManager, pJob);
-        case MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER_NODE: return ma_resource_manager_process_job__free_data_buffer_node(pResourceManager, pJob);
-        case MA_RESOURCE_MANAGER_JOB_PAGE_DATA_BUFFER_NODE: return ma_resource_manager_process_job__page_data_buffer_node(pResourceManager, pJob);
-
-        /* Data Buffer */
-        case MA_RESOURCE_MANAGER_JOB_LOAD_DATA_BUFFER: return ma_resource_manager_process_job__load_data_buffer(pResourceManager, pJob);
-        case MA_RESOURCE_MANAGER_JOB_FREE_DATA_BUFFER: return ma_resource_manager_process_job__free_data_buffer(pResourceManager, pJob);
-
-        /* Data Stream */
-        case MA_RESOURCE_MANAGER_JOB_LOAD_DATA_STREAM: return ma_resource_manager_process_job__load_data_stream(pResourceManager, pJob);
-        case MA_RESOURCE_MANAGER_JOB_FREE_DATA_STREAM: return ma_resource_manager_process_job__free_data_stream(pResourceManager, pJob);
-        case MA_RESOURCE_MANAGER_JOB_PAGE_DATA_STREAM: return ma_resource_manager_process_job__page_data_stream(pResourceManager, pJob);
-        case MA_RESOURCE_MANAGER_JOB_SEEK_DATA_STREAM: return ma_resource_manager_process_job__seek_data_stream(pResourceManager, pJob);
-
-        default: break;
-    }
-
-    /* Getting here means we don't know what the job code is and cannot do anything with it. */
-    return MA_INVALID_OPERATION;
+    return ma_job_process(pJob);
 }
 
 MA_API ma_result ma_resource_manager_process_next_job(ma_resource_manager* pResourceManager)
 {
     ma_result result;
-    ma_resource_manager_job job;
+    ma_job job;
 
     if (pResourceManager == NULL) {
         return MA_INVALID_ARGS;
@@ -56324,8 +56729,19 @@ MA_API ma_result ma_resource_manager_process_next_job(ma_resource_manager* pReso
         return result;
     }
 
-    return ma_resource_manager_process_job(pResourceManager, &job);
+    return ma_job_process(&job);
 }
+#else
+/* We'll get here if the resource manager is being excluded from the build. We need to define the job processing callbacks as no-ops. */
+static ma_result ma_job_process__resource_manager__load_data_buffer_node(ma_job* pJob) { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__free_data_buffer_node(ma_job* pJob) { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__page_data_buffer_node(ma_job* pJob) { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__load_data_buffer(ma_job* pJob)      { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__free_data_buffer(ma_job* pJob)      { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__load_data_stream(ma_job* pJob)      { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__free_data_stream(ma_job* pJob)      { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__page_data_stream(ma_job* pJob)      { return ma_job_process__noop(pJob); }
+static ma_result ma_job_process__resource_manager__seek_data_stream(ma_job* pJob)      { return ma_job_process__noop(pJob); }
 #endif  /* MA_NO_RESOURCE_MANAGER */
 
 
@@ -56425,6 +56841,28 @@ static ma_bool32 ma_node_graph_is_reading(ma_node_graph* pNodeGraph)
 #endif
 
 
+static void ma_node_graph_node_process_pcm_frames(ma_node* pNode, const float** ppFramesIn, ma_uint32* pFrameCountIn, float** ppFramesOut, ma_uint32* pFrameCountOut)
+{
+    ma_node_graph* pNodeGraph = (ma_node_graph*)pNode;
+    ma_uint64 framesRead;
+
+    ma_node_graph_read_pcm_frames(pNodeGraph, ppFramesOut[0], *pFrameCountOut, &framesRead);
+
+    *pFrameCountOut = (ma_uint32)framesRead;    /* Safe cast. */
+
+    (void)ppFramesIn;
+    (void)pFrameCountIn;
+}
+
+static ma_node_vtable g_node_graph_node_vtable =
+{
+    ma_node_graph_node_process_pcm_frames,
+    NULL,   /* onGetRequiredInputFrameCount */
+    0,      /* 0 input buses. */
+    1,      /* 1 output bus. */
+    0       /* Flags. */
+};
+
 static void ma_node_graph_endpoint_process_pcm_frames(ma_node* pNode, const float** ppFramesIn, ma_uint32* pFrameCountIn, float** ppFramesOut, ma_uint32* pFrameCountOut)
 {
     MA_ASSERT(pNode != NULL);
@@ -56461,6 +56899,7 @@ static ma_node_vtable g_node_graph_endpoint_vtable =
 MA_API ma_result ma_node_graph_init(const ma_node_graph_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_node_graph* pNodeGraph)
 {
     ma_result result;
+    ma_node_config baseConfig;
     ma_node_config endpointConfig;
 
     if (pNodeGraph == NULL) {
@@ -56473,6 +56912,19 @@ MA_API ma_result ma_node_graph_init(const ma_node_graph_config* pConfig, const m
         pNodeGraph->nodeCacheCapInFrames = MA_DEFAULT_NODE_CACHE_CAP_IN_FRAMES_PER_BUS;
     }
 
+
+    /* Base node so we can use the node graph as a node into another graph. */
+    baseConfig = ma_node_config_init();
+    baseConfig.vtable = &g_node_graph_node_vtable;
+    baseConfig.pOutputChannels = &pConfig->channels;
+
+    result = ma_node_init(pNodeGraph, &baseConfig, pAllocationCallbacks, &pNodeGraph->base);
+    if (result != MA_SUCCESS) {
+        return result;
+    }
+
+
+    /* Endpoint. */
     endpointConfig = ma_node_config_init();
     endpointConfig.vtable          = &g_node_graph_endpoint_vtable;
     endpointConfig.pInputChannels  = &pConfig->channels;
@@ -56480,6 +56932,7 @@ MA_API ma_result ma_node_graph_init(const ma_node_graph_config* pConfig, const m
 
     result = ma_node_init(pNodeGraph, &endpointConfig, pAllocationCallbacks, &pNodeGraph->endpoint);
     if (result != MA_SUCCESS) {
+        ma_node_uninit(&pNodeGraph->base, pAllocationCallbacks);
         return result;
     }
 
@@ -59371,8 +59824,8 @@ static void ma_engine_node_process_pcm_frames__general(ma_engine_node* pEngineNo
             framesJustProcessedIn  = (ma_uint32)resampleFrameCountIn;
             framesJustProcessedOut = (ma_uint32)resampleFrameCountOut;
         } else {
-            framesJustProcessedIn  = framesAvailableIn;
-            framesJustProcessedOut = framesAvailableOut;
+            framesJustProcessedIn  = ma_min(framesAvailableIn, framesAvailableOut);
+            framesJustProcessedOut = framesJustProcessedIn; /* When no resampling is being performed, the number of output frames is the same as input frames. */
         }
 
         /* Fading. */
@@ -60360,7 +60813,7 @@ MA_API ma_uint64 ma_engine_get_time(const ma_engine* pEngine)
     return ma_node_graph_get_time(&pEngine->nodeGraph);
 }
 
-MA_API ma_uint64 ma_engine_set_time(ma_engine* pEngine, ma_uint64 globalTime)
+MA_API ma_result ma_engine_set_time(ma_engine* pEngine, ma_uint64 globalTime)
 {
     return ma_node_graph_set_time(&pEngine->nodeGraph, globalTime);
 }
@@ -61160,6 +61613,10 @@ MA_API void ma_sound_set_pitch(ma_sound* pSound, float pitch)
         return;
     }
 
+    if (pitch <= 0) {
+        return;
+    }
+
     c89atomic_exchange_explicit_f32(&pSound->engineNode.pitch, pitch, c89atomic_memory_order_release);
 }
 
@@ -61703,6 +62160,34 @@ MA_API ma_result ma_sound_get_length_in_pcm_frames(ma_sound* pSound, ma_uint64* 
     }
 
     return ma_data_source_get_length_in_pcm_frames(pSound->pDataSource, pLength);
+}
+
+MA_API ma_result ma_sound_get_cursor_in_seconds(ma_sound* pSound, float* pCursor)
+{
+    if (pSound == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    /* The notion of a cursor is only valid for sounds that are backed by a data source. */
+    if (pSound->pDataSource == NULL) {
+        return MA_INVALID_OPERATION;
+    }
+
+    return ma_data_source_get_cursor_in_seconds(pSound->pDataSource, pCursor);
+}
+
+MA_API ma_result ma_sound_get_length_in_seconds(ma_sound* pSound, float* pLength)
+{
+    if (pSound == NULL) {
+        return MA_INVALID_ARGS;
+    }
+
+    /* The notion of a sound length is only valid for sounds that are backed by a data source. */
+    if (pSound->pDataSource == NULL) {
+        return MA_INVALID_OPERATION;
+    }
+
+    return ma_data_source_get_length_in_seconds(pSound->pDataSource, pLength);
 }
 
 
